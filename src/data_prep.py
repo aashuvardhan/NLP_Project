@@ -5,16 +5,21 @@ Builds the final merged dataset for the P3 Norm Classifier project.
 
 Sources:
   NORM (label=1):
-    - culturebank_reddit.csv  → first sentence of eval_whole_desc, agreement >= 0.7
-    - culturebank_tiktok.csv  → first sentence of eval_whole_desc, agreement >= 0.7
+    - culturebank_reddit.csv  → constructed from context + cultural_group + actor_behavior
+    - culturebank_tiktok.csv  → same, agreement >= 0.7
+    Two sentence templates used (50/50) to break structural shortcut:
+      Template A: "In {context}, {group} {behavior}."
+      Template B: "{group} {behavior} in {context}."
 
   NON-NORM / Hard Negatives (label=0):
-    - ag_news_train.parquet   → factual world/news sentences about people & countries
-    - ag_news_test.parquet    → same
-    - squad.parquet           → factual passages about human activities (sentence-split)
-    - wikipedia.parquet       → broad factual sentences (keyword-filtered)
+    - stereotype.parquet       → StereoSet anti-stereotype sentences (gold_label=1)
+                                 combined with context; contains cultural groups + behavior
+    - crows_pairs_anonymized.csv → CrowS-Pairs sent_less column only
+                                   (less-stereotyping side; cultural + behavioral)
+    - squad.parquet            → factual passages about human activities (sentence-split)
+    - wikipedia.parquet        → factual sentences (50% structural, 50% general)
 
-  All non-norm sources are keyword-filtered to remove sentences that look like norms.
+  AG News REMOVED — Reuters/AP formatting was a trivial non-norm signal.
 
 Output:
   data/merged_full.csv
@@ -35,12 +40,12 @@ RAW_DIR  = os.path.join(BASE, "data", "raw")
 DATA_OUT = os.path.join(BASE, "data")
 os.makedirs(DATA_OUT, exist_ok=True)
 
-REDDIT_PATH     = os.path.join(RAW_DIR, "culturebank_reddit.csv")
-TIKTOK_PATH     = os.path.join(RAW_DIR, "culturebank_tiktok.csv")
-AG_TRAIN_PATH   = os.path.join(RAW_DIR, "ag_news_train.parquet")
-AG_TEST_PATH    = os.path.join(RAW_DIR, "ag_news_test.parquet")
-SQUAD_PATH      = os.path.join(RAW_DIR, "squad.parquet")
-WIKIPEDIA_PATH  = os.path.join(RAW_DIR, "wikipedia.parquet")
+REDDIT_PATH      = os.path.join(RAW_DIR, "culturebank_reddit.csv")
+TIKTOK_PATH      = os.path.join(RAW_DIR, "culturebank_tiktok.csv")
+STEREOSET_PATH   = os.path.join(RAW_DIR, "stereotype.parquet")
+CROWS_PATH       = os.path.join(RAW_DIR, "crows_pairs_anonymized.csv")
+SQUAD_PATH       = os.path.join(RAW_DIR, "squad.parquet")
+WIKIPEDIA_PATH   = os.path.join(RAW_DIR, "wikipedia.parquet")
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 AGREEMENT_THRESH = 0.70
@@ -48,7 +53,7 @@ MIN_WORDS        = 5
 MAX_WORDS        = 80
 RANDOM_SEED      = 42
 
-# Sentences with any of these keywords are too norm-like for the non-norm set.
+# Sentences with any of these are too norm-like for the non-norm set.
 NORM_KEYWORDS = [
     "should", "must", "expected to", "it is customary",
     "it is common to", "traditionally", "norm", "etiquette",
@@ -70,78 +75,63 @@ def is_valid(text: str) -> bool:
     return MIN_WORDS <= len(text.split()) <= MAX_WORDS
 
 def is_clean_non_norm(sentence: str) -> bool:
-    """True if the sentence contains no norm-like behavioral keywords."""
     sl = sentence.lower()
     return not any(kw in sl for kw in NORM_KEYWORDS)
 
 def split_sentences(text: str) -> list:
-    """Split a paragraph into individual sentences."""
     text = clean_text(text)
     parts = re.split(r'(?<=[.!?])\s+(?=[A-Z])', text)
     return [s.strip() for s in parts if s.strip()]
 
-def clean_ag_text(text: str) -> str:
-    """Clean AG News text: remove backslash sequences and source prefixes."""
-    # Replace escaped sequences (\\band → ' band')
-    text = re.sub(r'\\+', ' ', text)
-    # Remove parenthetical source tags like (Reuters), (AP)
-    text = re.sub(r'\([A-Z][A-Za-z\s&\.]+\)', '', text)
-    # Remove leading "Source - " prefix
-    text = re.sub(r'^[A-Z][A-Za-z\s&]+\s*-\s+', '', text)
-    return clean_text(text)
-
 
 # ─── NORM data ────────────────────────────────────────────────────────────────
-def build_norm_sentence(row) -> str:
+def build_norm_sentence(row, template: str) -> str:
     """
-    Construct a natural norm sentence from CultureBank fields:
-        "In [context], [cultural_group] [actor_behavior]."
+    Construct a natural norm sentence from CultureBank fields.
+    Two templates break the single-pattern structural shortcut:
+
+    Template A (50%): "In {context}, {group} {behavior}."
+    Template B (50%): "{group} {behavior} in {context}."
 
     Why NOT eval_whole_desc?
-      eval_whole_desc is GPT-generated boilerplate. Every sentence ends with
-      "widely regarded as a common practice within the sampled population" —
-      a perfect lexical fingerprint that makes the task trivially easy (>99% acc).
-
-    Why NOT raw actor_behavior?
-      actor_behavior is a fragment: "dress casually, often in comfortable clothing"
-      — not a grammatical sentence.
-
-    Constructed sentence example:
-      context        = "restaurant and service industry settings"
-      cultural_group = "Americans"
-      actor_behavior = "engage in tipping culture with varying expectations"
-      → "In restaurant and service industry settings, Americans engage in
-         tipping culture with varying expectations."
+      GPT-generated boilerplate ending in "widely regarded as a common practice
+      within the sampled population" — a lexical fingerprint that trivialises the task.
     """
     context  = clean_text(str(row.get("context", "")))
     group    = clean_text(str(row.get("cultural group", "")))
     behavior = clean_text(str(row.get("actor_behavior", "")))
 
-    # Fall back gracefully if any field is missing
-    if not context or context in ("nan", "unknown"):
-        context = ""
-    if not group or group in ("nan", "unknown"):
-        group = ""
-    if not behavior or behavior in ("nan", "unknown"):
-        return ""
+    for val in [context, group, behavior]:
+        if not val or val in ("nan", "unknown"):
+            if val == behavior:
+                return ""   # behavior is required; others degrade gracefully
 
-    # If context already starts with a preposition ("in X", "at X"), don't add "In"
-    if context and re.match(r'^(in|at|during|within|across|among)\b', context, re.I):
-        prefix = context[0].upper() + context[1:]   # just capitalise it
-        if group:
-            sentence = f"{prefix}, {group} {behavior}."
+    context  = "" if context  in ("nan", "unknown") else context
+    group    = "" if group    in ("nan", "unknown") else group
+
+    if template == "A":
+        if context and group:
+            # Avoid "In in X" when context already starts with a preposition
+            if re.match(r'^(in|at|during|within|across|among)\b', context, re.I):
+                prefix = context[0].upper() + context[1:]
+                sentence = f"{prefix}, {group} {behavior}."
+            else:
+                sentence = f"In {context}, {group} {behavior}."
+        elif group:
+            sentence = f"{group} {behavior}."
         else:
-            sentence = f"{prefix}, people {behavior}."
-    elif context and group:
-        sentence = f"In {context}, {group} {behavior}."
-    elif group:
-        sentence = f"{group} {behavior}."
-    else:
-        sentence = f"{behavior}."
+            sentence = f"{behavior}."
+    else:  # template B  — "{group} {behavior} in {context}."
+        # Strip any leading preposition from context to avoid "in in X" or "in at X"
+        ctx_b = re.sub(r'^(in|at|during|within|across|among)\s+', '', context, flags=re.I)
+        if ctx_b and group:
+            sentence = f"{group} {behavior} in {ctx_b}."
+        elif group:
+            sentence = f"{group} {behavior}."
+        else:
+            sentence = f"{behavior}."
 
-    # Capitalise first letter
-    sentence = sentence[0].upper() + sentence[1:]
-    return sentence
+    return sentence[0].upper() + sentence[1:]
 
 
 def load_norms() -> pd.DataFrame:
@@ -154,7 +144,11 @@ def load_norms() -> pd.DataFrame:
         df = df[df["agreement"] >= AGREEMENT_THRESH].copy()
         print(f"[{source_name}] After agreement >= {AGREEMENT_THRESH}: {len(df)}")
 
-        df["sentence"] = df.apply(build_norm_sentence, axis=1)
+        # Assign templates 50/50 by row position (deterministic, no shuffle needed)
+        df = df.reset_index(drop=True)
+        df["_tmpl"] = df.index.map(lambda i: "A" if i % 2 == 0 else "B")
+        df["sentence"] = df.apply(lambda r: build_norm_sentence(r, r["_tmpl"]), axis=1)
+
         df["cultural_group"] = df["cultural group"].apply(
             lambda x: clean_text(str(x)) if pd.notna(x) else "unknown"
         )
@@ -173,55 +167,108 @@ def load_norms() -> pd.DataFrame:
 
 
 # ─── NON-NORM data (Hard Negatives) ──────────────────────────────────────────
-def load_ag_news(target_n: int) -> pd.DataFrame:
+def load_stereoset() -> pd.DataFrame:
     """
-    AG News: factual news sentences about world events, people, and countries.
-    e.g. "Japan's GDP grew by 2.1% in the third quarter of 2023."
-    Combines train + test splits for maximum coverage.
+    StereoSet — anti-stereotype sentences (gold_label=1) combined with context.
+
+    Why this kills the shortcut:
+      These sentences contain cultural group names + behavioral content
+      but are factual/neutral, NOT prescriptive norms.
+      e.g. "I know many people who are Russian. Most of them do not drink alcohol."
+           "Many people live in Ethiopia. The people are very thin and good at
+            distance running."
+
+    gold_label mapping: 0=stereotype, 1=anti-stereotype, 2=unrelated
+    We use ONLY 1 (anti-stereotype) — never stereotypes, never unrelated fillers.
     """
-    print(f"\n[ag_news] Loading from local parquets...")
-    parts = []
-    for path in [AG_TRAIN_PATH, AG_TEST_PATH]:
-        if os.path.exists(path):
-            parts.append(pd.read_parquet(path))
-    ag = pd.concat(parts, ignore_index=True)
-    print(f"[ag_news] Raw rows (train+test): {len(ag)}")
+    print(f"\n[stereoset] Loading from local parquet...")
+    st = pd.read_parquet(STEREOSET_PATH)
+    print(f"[stereoset] Raw rows: {len(st)}")
 
-    sentences = []
-    for text in ag["text"]:
-        cleaned = clean_ag_text(str(text))
-        for s in split_sentences(cleaned):
-            sentences.append(s)
+    rows = []
+    for _, row in st.iterrows():
+        context = clean_text(str(row["context"]))
+        data    = row["sentences"]                  # dict with numpy arrays
+        sents   = data["sentence"]
+        labels  = data["gold_label"]
 
-    print(f"[ag_news] Raw sentences extracted: {len(sentences)}")
+        for sent, gold in zip(sents, labels):
+            if int(gold) == 0:                      # anti-stereotype only (0=anti, 1=stereo, 2=unrelated)
+                full = clean_text(f"{context} {sent}")
+                rows.append(full)
 
-    df = pd.DataFrame({"sentence": sentences})
+    df = pd.DataFrame({"sentence": rows})
     df = df[df["sentence"].apply(is_valid)]
     df = df[df["sentence"].apply(is_clean_non_norm)]
     df = df.drop_duplicates(subset="sentence")
-    print(f"[ag_news] After filters + dedup: {len(df)}")
 
-    sample_n = min(target_n, len(df))
-    df = df.sample(n=sample_n, random_state=RANDOM_SEED)
     df["label"]          = 0
     df["cultural_group"] = "none"
-    df["source"]         = "ag_news"
-    print(f"[ag_news] Final sample: {len(df)}")
+    df["source"]         = "stereoset"
+    print(f"[stereoset] Anti-stereotype sentences kept: {len(df)}")
+    return df[["sentence", "label", "cultural_group", "source"]]
+
+
+def load_crows_pairs() -> pd.DataFrame:
+    """
+    CrowS-Pairs — sent_less column only (less-stereotyping sentence).
+
+    Note: sent_less replaces the disadvantaged group with the advantaged group.
+    Some sentences still contain negative characterisations — we apply a
+    content filter to remove overtly harmful sentences before using them.
+    """
+    # Only keep sentences that contain a cultural/national/racial group name —
+    # sentences without one add no value for closing the cultural group gap.
+    CULTURAL_TERMS = re.compile(
+        r'\b(American|Japanese|Indian|British|German|Italian|Chinese|Mexican|French|'
+        r'Korean|Russian|Australian|Canadian|Brazilian|Nigerian|Arab|Hispanic|'
+        r'African|Asian|Latino|Latina|Muslim|Jewish|Christian|Hindu|immigrant|'
+        r'white|black|brown|indigenous|native)\b', re.I
+    )
+
+    # Remove sentences with overtly harmful or violent language
+    BAD_CONTENT = [
+        "gang", "gangster", "criminal", "crime", "violent", "attack",
+        "murder", "rape", "terrorist", "bomb", "kill", "dead bodies",
+        "jail", "prison", "dumb", "stupid", "ignorant", "lazy",
+        "thief", "steal", "plotters", "inscrutable", "drug dealer",
+        "can't be good", "alcoholic", "don't believe in",
+    ]
+
+    def is_safe(text: str) -> bool:
+        tl = text.lower()
+        return not any(kw in tl for kw in BAD_CONTENT)
+
+    def has_cultural_term(text: str) -> bool:
+        return bool(CULTURAL_TERMS.search(text))
+
+    print(f"\n[crows_pairs] Loading from local CSV...")
+    cp = pd.read_csv(CROWS_PATH)
+    print(f"[crows_pairs] Raw rows: {len(cp)}")
+
+    df = pd.DataFrame({"sentence": cp["sent_less"].apply(clean_text)})
+    df = df[df["sentence"].apply(is_valid)]
+    df = df[df["sentence"].apply(is_clean_non_norm)]
+    df = df[df["sentence"].apply(is_safe)]
+    df = df[df["sentence"].apply(has_cultural_term)]   # only keep culturally-grounded ones
+    df = df.drop_duplicates(subset="sentence")
+
+    df["label"]          = 0
+    df["cultural_group"] = "none"
+    df["source"]         = "crows_pairs"
+    print(f"[crows_pairs] Sentences kept: {len(df)}")
     return df[["sentence", "label", "cultural_group", "source"]]
 
 
 def load_squad(target_n: int) -> pd.DataFrame:
     """
     SQuAD context passages split into sentences.
-    Passages are Wikipedia-sourced factual descriptions of human/cultural activities.
-    e.g. "The United States spends more per capita on healthcare than any other nation."
-    Contexts are deduplicated before splitting (many questions share one passage).
+    Factual descriptions of human activities across many domains.
     """
     print(f"\n[squad] Loading from local parquet...")
     sq = pd.read_parquet(SQUAD_PATH)
     print(f"[squad] Raw rows: {len(sq)}")
 
-    # Deduplicate contexts — same passage appears for multiple questions
     unique_contexts = sq["context"].drop_duplicates().tolist()
     print(f"[squad] Unique contexts: {len(unique_contexts)}")
 
@@ -249,8 +296,16 @@ def load_squad(target_n: int) -> pd.DataFrame:
 
 def load_wikipedia(target_n: int) -> pd.DataFrame:
     """
-    Wikipedia: broad factual sentences across all topics.
-    Keyword-filtered to remove any sentences resembling cultural norms (~2-5% removed).
+    Wikipedia split into two equal pools:
+
+    Pool A — Structural hard negatives:
+      Sentences starting "In [X], [Capital]..." — same template as norm sentences
+      but purely factual (dates, events, statistics).
+      Forces the model to look beyond sentence structure.
+
+    Pool B — General factual sentences:
+      Broad topic diversity (science, geography, history, etc.)
+      Prevents topic-shortcut learning.
     """
     print(f"\n[wikipedia] Loading from local parquet...")
     wiki = pd.read_parquet(WIKIPEDIA_PATH)
@@ -260,31 +315,52 @@ def load_wikipedia(target_n: int) -> pd.DataFrame:
     wiki = wiki[wiki["sentence"].apply(is_valid)]
     wiki = wiki[wiki["sentence"].apply(is_clean_non_norm)]
     wiki = wiki.drop_duplicates(subset="sentence")
-    print(f"[wikipedia] After filters + dedup: {len(wiki)}")
+    print(f"[wikipedia] After keyword filter + dedup: {len(wiki)}")
 
-    sample_n = min(target_n, len(wiki))
-    wiki = wiki.sample(n=sample_n, random_state=RANDOM_SEED)
-    wiki["label"]          = 0
-    wiki["cultural_group"] = "none"
-    wiki["source"]         = "wikipedia"
-    print(f"[wikipedia] Final sample: {len(wiki)}")
-    return wiki[["sentence", "label", "cultural_group", "source"]]
+    structural_mask = wiki["sentence"].str.match(r'^In [A-Z][a-z].*,\s+[A-Z][a-z]', na=False)
+    pool_a = wiki[structural_mask]
+    pool_b = wiki[~structural_mask]
+    print(f"[wikipedia] Pool A (structural): {len(pool_a)} | Pool B (general): {len(pool_b)}")
+
+    half  = target_n // 2
+    a_n   = min(half, len(pool_a))
+    b_n   = min(target_n - a_n, len(pool_b))
+
+    sampled = pd.concat([
+        pool_a.sample(n=a_n, random_state=RANDOM_SEED),
+        pool_b.sample(n=b_n, random_state=RANDOM_SEED),
+    ], ignore_index=True)
+
+    sampled["label"]          = 0
+    sampled["cultural_group"] = "none"
+    sampled["source"]         = "wikipedia"
+    print(f"[wikipedia] Final sample: {len(sampled)}  (structural={a_n}, general={b_n})")
+    return sampled[["sentence", "label", "cultural_group", "source"]]
 
 
 def load_non_norms(target_count: int) -> pd.DataFrame:
     """
-    Combine three hard-negative sources, splitting the target evenly.
-    AG News + SQuAD are primary (people/world focus).
-    Wikipedia fills remainder as supplementary factual sentences.
+    Non-norm budget:
+      StereoSet  — all available (~700)    : highest-quality hard negatives
+      CrowS-Pairs — all available (~1,400)  : cultural group + behavioral sentences
+      SQuAD      — fills ~30% of remainder  : factual human-activity passages
+      Wikipedia  — fills ~70% of remainder  : structural + general factual sentences
+
+    StereoSet and CrowS-Pairs are used in full (they're small but high quality).
+    SQuAD and Wikipedia fill up to the target.
     """
-    per_source = target_count // 3
-    remainder  = target_count % 3   # extra rows go to ag_news
+    stereo_df = load_stereoset()
+    crows_df  = load_crows_pairs()
 
-    ag_df   = load_ag_news(per_source + remainder)
-    sq_df   = load_squad(per_source)
-    wiki_df = load_wikipedia(per_source)
+    filled    = len(stereo_df) + len(crows_df)
+    remaining = max(0, target_count - filled)
+    sq_n      = remaining // 3
+    wiki_n    = remaining - sq_n
 
-    non_norms = pd.concat([ag_df, sq_df, wiki_df], ignore_index=True)
+    sq_df   = load_squad(sq_n)
+    wiki_df = load_wikipedia(wiki_n)
+
+    non_norms = pd.concat([stereo_df, crows_df, sq_df, wiki_df], ignore_index=True)
     non_norms = non_norms.drop_duplicates(subset="sentence")
     print(f"\nTotal NON-NORM rows (deduplicated): {len(non_norms)}")
     return non_norms
@@ -305,7 +381,7 @@ def build_dataset():
     non_norms = non_norms.sample(n=n, random_state=RANDOM_SEED)
 
     merged = pd.concat([norms, non_norms], ignore_index=True)
-    # Full shuffle — no clusters of norm/non-norm
+    # Full shuffle — no clusters
     merged = merged.sample(frac=1, random_state=RANDOM_SEED).reset_index(drop=True)
 
     print(f"\n{'='*50}")

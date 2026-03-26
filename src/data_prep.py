@@ -5,16 +5,22 @@ Builds the final merged dataset for the P3 Norm Classifier project.
 
 Sources:
   NORM (label=1):
-    - culturebank_reddit.csv   → actor_behavior, agreement >= 0.7
-    - culturebank_tiktok.csv   → actor_behavior, agreement >= 0.7
+    - culturebank_reddit.csv  → first sentence of eval_whole_desc, agreement >= 0.7
+    - culturebank_tiktok.csv  → first sentence of eval_whole_desc, agreement >= 0.7
 
-  NON-NORM (label=0):
-    - wikipedia.parquet        → sentence column, ~20-25K sentences
-                                 (keyword-filtered to remove cultural/behavioral sentences)
+  NON-NORM / Hard Negatives (label=0):
+    - ag_news_train.parquet   → factual world/news sentences about people & countries
+    - ag_news_test.parquet    → same
+    - squad.parquet           → factual passages about human activities (sentence-split)
+    - wikipedia.parquet       → broad factual sentences (keyword-filtered)
+
+  All non-norm sources are keyword-filtered to remove sentences that look like norms.
 
 Output:
-  data/train.csv, data/val.csv, data/test.csv  (80 / 10 / 10 split)
-  data/merged_full.csv                          (complete merged dataset)
+  data/merged_full.csv
+  data/train.csv  (80%)
+  data/val.csv    (10%)
+  data/test.csv   (10%)
 """
 
 import os
@@ -24,65 +30,100 @@ import numpy as np
 from sklearn.model_selection import train_test_split
 
 # ─── Paths ────────────────────────────────────────────────────────────────────
-BASE      = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-RAW_DIR   = os.path.join(BASE, "data", "raw")
-DATA_OUT  = os.path.join(BASE, "data")
+BASE     = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+RAW_DIR  = os.path.join(BASE, "data", "raw")
+DATA_OUT = os.path.join(BASE, "data")
 os.makedirs(DATA_OUT, exist_ok=True)
 
 REDDIT_PATH     = os.path.join(RAW_DIR, "culturebank_reddit.csv")
 TIKTOK_PATH     = os.path.join(RAW_DIR, "culturebank_tiktok.csv")
+AG_TRAIN_PATH   = os.path.join(RAW_DIR, "ag_news_train.parquet")
+AG_TEST_PATH    = os.path.join(RAW_DIR, "ag_news_test.parquet")
+SQUAD_PATH      = os.path.join(RAW_DIR, "squad.parquet")
 WIKIPEDIA_PATH  = os.path.join(RAW_DIR, "wikipedia.parquet")
 
 # ─── Config ───────────────────────────────────────────────────────────────────
-AGREEMENT_THRESH = 0.70   # CultureBank quality filter
+AGREEMENT_THRESH = 0.70
+MIN_WORDS        = 5
+MAX_WORDS        = 80
+RANDOM_SEED      = 42
 
-MIN_WORDS = 5
-MAX_WORDS = 80
-
-RANDOM_SEED = 42
-
-# Keywords that indicate a sentence is culturally/behaviorally normative.
-# Sentences containing any of these are removed from the Wikipedia non-norm set.
+# Sentences with any of these keywords are too norm-like for the non-norm set.
 NORM_KEYWORDS = [
     "should", "must", "expected to", "it is customary",
     "it is common to", "traditionally", "norm", "etiquette",
     "polite", "rude", "respectful", "greeting", "bow", "tip",
 ]
 
-# ─── Text cleaning ────────────────────────────────────────────────────────────
+# ─── Text helpers ─────────────────────────────────────────────────────────────
 def clean_text(text: str) -> str:
     if not isinstance(text, str):
         return ""
     text = text.strip()
     text = re.sub(r'\s+', ' ', text)
     text = re.sub(r'[^\x00-\x7F]+', ' ', text)
-    text = text.strip()
-    return text
+    return text.strip()
 
 def is_valid(text: str) -> bool:
-    """Keep sentences with between MIN_WORDS and MAX_WORDS words."""
     if not text:
         return False
-    words = text.split()
-    return MIN_WORDS <= len(words) <= MAX_WORDS
+    return MIN_WORDS <= len(text.split()) <= MAX_WORDS
 
 def is_clean_non_norm(sentence: str) -> bool:
-    """Return True if sentence contains no norm-like keywords."""
-    sentence_lower = sentence.lower()
-    return not any(kw in sentence_lower for kw in NORM_KEYWORDS)
+    """True if the sentence contains no norm-like behavioral keywords."""
+    sl = sentence.lower()
+    return not any(kw in sl for kw in NORM_KEYWORDS)
 
-# ─── Load NORM data ───────────────────────────────────────────────────────────
+def first_sentence(text: str) -> str:
+    """Extract the first complete sentence from eval_whole_desc."""
+    text = clean_text(text)
+    # Split on '. ' or '.\n' only when followed by an uppercase letter
+    parts = re.split(r'\.\s+(?=[A-Z])', text)
+    sentence = parts[0].strip()
+    if sentence and not sentence.endswith('.'):
+        sentence += '.'
+    return sentence
+
+def split_sentences(text: str) -> list:
+    """Split a paragraph into individual sentences."""
+    text = clean_text(text)
+    parts = re.split(r'(?<=[.!?])\s+(?=[A-Z])', text)
+    return [s.strip() for s in parts if s.strip()]
+
+def clean_ag_text(text: str) -> str:
+    """Clean AG News text: remove backslash sequences and source prefixes."""
+    # Replace escaped sequences (\\band → ' band')
+    text = re.sub(r'\\+', ' ', text)
+    # Remove parenthetical source tags like (Reuters), (AP)
+    text = re.sub(r'\([A-Z][A-Za-z\s&\.]+\)', '', text)
+    # Remove leading "Source - " prefix
+    text = re.sub(r'^[A-Z][A-Za-z\s&]+\s*-\s+', '', text)
+    return clean_text(text)
+
+
+# ─── NORM data ────────────────────────────────────────────────────────────────
 def load_norms() -> pd.DataFrame:
+    """
+    Load CultureBank norms using the FIRST SENTENCE of eval_whole_desc.
+
+    Why eval_whole_desc instead of actor_behavior?
+      actor_behavior = fragment: "dress casually, often in comfortable clothing"
+      eval_whole_desc first sentence = full grammatical norm statement:
+        "In public settings within American culture, it is common for people
+         to dress casually, often opting for comfortable clothing such as sweatpants."
+
+    The first sentence is the concise core norm statement ("In X, Y group does Z").
+    """
     dfs = []
     for path, source_name in [(REDDIT_PATH, "culturebank_reddit"),
-                               (TIKTOK_PATH,  "culturebank_tiktok")]:
+                               (TIKTOK_PATH, "culturebank_tiktok")]:
         df = pd.read_csv(path)
         print(f"[{source_name}] Raw rows: {len(df)}")
 
         df = df[df["agreement"] >= AGREEMENT_THRESH].copy()
         print(f"[{source_name}] After agreement >= {AGREEMENT_THRESH}: {len(df)}")
 
-        df["sentence"]       = df["actor_behavior"].apply(clean_text)
+        df["sentence"] = df["eval_whole_desc"].apply(first_sentence)
         df["cultural_group"] = df["cultural group"].apply(
             lambda x: clean_text(str(x)) if pd.notna(x) else "unknown"
         )
@@ -99,46 +140,141 @@ def load_norms() -> pd.DataFrame:
     print(f"\nTotal NORM rows (deduplicated): {len(norms)}")
     return norms
 
-# ─── Load NON-NORM data ───────────────────────────────────────────────────────
-def load_non_norms(target_count: int) -> pd.DataFrame:
+
+# ─── NON-NORM data (Hard Negatives) ──────────────────────────────────────────
+def load_ag_news(target_n: int) -> pd.DataFrame:
+    """
+    AG News: factual news sentences about world events, people, and countries.
+    e.g. "Japan's GDP grew by 2.1% in the third quarter of 2023."
+    Combines train + test splits for maximum coverage.
+    """
+    print(f"\n[ag_news] Loading from local parquets...")
+    parts = []
+    for path in [AG_TRAIN_PATH, AG_TEST_PATH]:
+        if os.path.exists(path):
+            parts.append(pd.read_parquet(path))
+    ag = pd.concat(parts, ignore_index=True)
+    print(f"[ag_news] Raw rows (train+test): {len(ag)}")
+
+    sentences = []
+    for text in ag["text"]:
+        cleaned = clean_ag_text(str(text))
+        for s in split_sentences(cleaned):
+            sentences.append(s)
+
+    print(f"[ag_news] Raw sentences extracted: {len(sentences)}")
+
+    df = pd.DataFrame({"sentence": sentences})
+    df = df[df["sentence"].apply(is_valid)]
+    df = df[df["sentence"].apply(is_clean_non_norm)]
+    df = df.drop_duplicates(subset="sentence")
+    print(f"[ag_news] After filters + dedup: {len(df)}")
+
+    sample_n = min(target_n, len(df))
+    df = df.sample(n=sample_n, random_state=RANDOM_SEED)
+    df["label"]          = 0
+    df["cultural_group"] = "none"
+    df["source"]         = "ag_news"
+    print(f"[ag_news] Final sample: {len(df)}")
+    return df[["sentence", "label", "cultural_group", "source"]]
+
+
+def load_squad(target_n: int) -> pd.DataFrame:
+    """
+    SQuAD context passages split into sentences.
+    Passages are Wikipedia-sourced factual descriptions of human/cultural activities.
+    e.g. "The United States spends more per capita on healthcare than any other nation."
+    Contexts are deduplicated before splitting (many questions share one passage).
+    """
+    print(f"\n[squad] Loading from local parquet...")
+    sq = pd.read_parquet(SQUAD_PATH)
+    print(f"[squad] Raw rows: {len(sq)}")
+
+    # Deduplicate contexts — same passage appears for multiple questions
+    unique_contexts = sq["context"].drop_duplicates().tolist()
+    print(f"[squad] Unique contexts: {len(unique_contexts)}")
+
+    sentences = []
+    for ctx in unique_contexts:
+        for s in split_sentences(str(ctx)):
+            sentences.append(clean_text(s))
+
+    print(f"[squad] Raw sentences from unique contexts: {len(sentences)}")
+
+    df = pd.DataFrame({"sentence": sentences})
+    df = df[df["sentence"].apply(is_valid)]
+    df = df[df["sentence"].apply(is_clean_non_norm)]
+    df = df.drop_duplicates(subset="sentence")
+    print(f"[squad] After filters + dedup: {len(df)}")
+
+    sample_n = min(target_n, len(df))
+    df = df.sample(n=sample_n, random_state=RANDOM_SEED)
+    df["label"]          = 0
+    df["cultural_group"] = "none"
+    df["source"]         = "squad"
+    print(f"[squad] Final sample: {len(df)}")
+    return df[["sentence", "label", "cultural_group", "source"]]
+
+
+def load_wikipedia(target_n: int) -> pd.DataFrame:
+    """
+    Wikipedia: broad factual sentences across all topics.
+    Keyword-filtered to remove any sentences resembling cultural norms (~2-5% removed).
+    """
+    print(f"\n[wikipedia] Loading from local parquet...")
     wiki = pd.read_parquet(WIKIPEDIA_PATH)
-    print(f"\n[wikipedia] Raw rows: {len(wiki)}")
+    print(f"[wikipedia] Raw rows: {len(wiki)}")
 
     wiki["sentence"] = wiki["sentence"].apply(clean_text)
-
-    # Length filter
     wiki = wiki[wiki["sentence"].apply(is_valid)]
-    print(f"[wikipedia] After length filter: {len(wiki)}")
-
-    # Keyword filter — remove sentences that look like norms
     wiki = wiki[wiki["sentence"].apply(is_clean_non_norm)]
-    print(f"[wikipedia] After keyword filter: {len(wiki)}")
-
-    # Sample to match norm count (target ~20-25K, capped by what's available)
-    sample_n = min(target_count, len(wiki))
-    wiki = wiki.sample(n=sample_n, random_state=RANDOM_SEED)
-    print(f"[wikipedia] Sampled: {len(wiki)}")
-
     wiki = wiki.drop_duplicates(subset="sentence")
+    print(f"[wikipedia] After filters + dedup: {len(wiki)}")
+
+    sample_n = min(target_n, len(wiki))
+    wiki = wiki.sample(n=sample_n, random_state=RANDOM_SEED)
     wiki["label"]          = 0
     wiki["cultural_group"] = "none"
     wiki["source"]         = "wikipedia"
-
-    print(f"\nTotal NON-NORM rows (deduplicated): {len(wiki)}")
+    print(f"[wikipedia] Final sample: {len(wiki)}")
     return wiki[["sentence", "label", "cultural_group", "source"]]
+
+
+def load_non_norms(target_count: int) -> pd.DataFrame:
+    """
+    Combine three hard-negative sources, splitting the target evenly.
+    AG News + SQuAD are primary (people/world focus).
+    Wikipedia fills remainder as supplementary factual sentences.
+    """
+    per_source = target_count // 3
+    remainder  = target_count % 3   # extra rows go to ag_news
+
+    ag_df   = load_ag_news(per_source + remainder)
+    sq_df   = load_squad(per_source)
+    wiki_df = load_wikipedia(per_source)
+
+    non_norms = pd.concat([ag_df, sq_df, wiki_df], ignore_index=True)
+    non_norms = non_norms.drop_duplicates(subset="sentence")
+    print(f"\nTotal NON-NORM rows (deduplicated): {len(non_norms)}")
+    return non_norms
+
 
 # ─── Merge & split ────────────────────────────────────────────────────────────
 def build_dataset():
-    norms     = load_norms()
-    non_norms = load_non_norms(target_count=len(norms))   # 1:1 balance
+    print("\n" + "="*60)
+    print("  P3 Norm Classifier — Data Preparation")
+    print("="*60 + "\n")
 
-    # Trim majority class to exact 1:1
+    norms     = load_norms()
+    non_norms = load_non_norms(target_count=len(norms))
+
+    # Trim to exact 1:1 balance
     n         = min(len(norms), len(non_norms))
     norms     = norms.sample(n=n, random_state=RANDOM_SEED)
     non_norms = non_norms.sample(n=n, random_state=RANDOM_SEED)
 
     merged = pd.concat([norms, non_norms], ignore_index=True)
-    # Shuffle so norms and non-norms are fully interleaved (no clusters)
+    # Full shuffle — no clusters of norm/non-norm
     merged = merged.sample(frac=1, random_state=RANDOM_SEED).reset_index(drop=True)
 
     print(f"\n{'='*50}")
@@ -151,7 +287,7 @@ def build_dataset():
     merged.to_csv(os.path.join(DATA_OUT, "merged_full.csv"), index=False)
     print("Saved -> data/merged_full.csv")
 
-    # ── Train / Val / Test split (80 / 10 / 10) ──
+    # ── Train / Val / Test split (80 / 10 / 10, stratified) ──
     train, temp = train_test_split(
         merged, test_size=0.20, random_state=RANDOM_SEED, stratify=merged["label"]
     )

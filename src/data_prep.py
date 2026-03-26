@@ -74,16 +74,6 @@ def is_clean_non_norm(sentence: str) -> bool:
     sl = sentence.lower()
     return not any(kw in sl for kw in NORM_KEYWORDS)
 
-def first_sentence(text: str) -> str:
-    """Extract the first complete sentence from eval_whole_desc."""
-    text = clean_text(text)
-    # Split on '. ' or '.\n' only when followed by an uppercase letter
-    parts = re.split(r'\.\s+(?=[A-Z])', text)
-    sentence = parts[0].strip()
-    if sentence and not sentence.endswith('.'):
-        sentence += '.'
-    return sentence
-
 def split_sentences(text: str) -> list:
     """Split a paragraph into individual sentences."""
     text = clean_text(text)
@@ -102,18 +92,59 @@ def clean_ag_text(text: str) -> str:
 
 
 # ─── NORM data ────────────────────────────────────────────────────────────────
+def build_norm_sentence(row) -> str:
+    """
+    Construct a natural norm sentence from CultureBank fields:
+        "In [context], [cultural_group] [actor_behavior]."
+
+    Why NOT eval_whole_desc?
+      eval_whole_desc is GPT-generated boilerplate. Every sentence ends with
+      "widely regarded as a common practice within the sampled population" —
+      a perfect lexical fingerprint that makes the task trivially easy (>99% acc).
+
+    Why NOT raw actor_behavior?
+      actor_behavior is a fragment: "dress casually, often in comfortable clothing"
+      — not a grammatical sentence.
+
+    Constructed sentence example:
+      context        = "restaurant and service industry settings"
+      cultural_group = "Americans"
+      actor_behavior = "engage in tipping culture with varying expectations"
+      → "In restaurant and service industry settings, Americans engage in
+         tipping culture with varying expectations."
+    """
+    context  = clean_text(str(row.get("context", "")))
+    group    = clean_text(str(row.get("cultural group", "")))
+    behavior = clean_text(str(row.get("actor_behavior", "")))
+
+    # Fall back gracefully if any field is missing
+    if not context or context in ("nan", "unknown"):
+        context = ""
+    if not group or group in ("nan", "unknown"):
+        group = ""
+    if not behavior or behavior in ("nan", "unknown"):
+        return ""
+
+    # If context already starts with a preposition ("in X", "at X"), don't add "In"
+    if context and re.match(r'^(in|at|during|within|across|among)\b', context, re.I):
+        prefix = context[0].upper() + context[1:]   # just capitalise it
+        if group:
+            sentence = f"{prefix}, {group} {behavior}."
+        else:
+            sentence = f"{prefix}, people {behavior}."
+    elif context and group:
+        sentence = f"In {context}, {group} {behavior}."
+    elif group:
+        sentence = f"{group} {behavior}."
+    else:
+        sentence = f"{behavior}."
+
+    # Capitalise first letter
+    sentence = sentence[0].upper() + sentence[1:]
+    return sentence
+
+
 def load_norms() -> pd.DataFrame:
-    """
-    Load CultureBank norms using the FIRST SENTENCE of eval_whole_desc.
-
-    Why eval_whole_desc instead of actor_behavior?
-      actor_behavior = fragment: "dress casually, often in comfortable clothing"
-      eval_whole_desc first sentence = full grammatical norm statement:
-        "In public settings within American culture, it is common for people
-         to dress casually, often opting for comfortable clothing such as sweatpants."
-
-    The first sentence is the concise core norm statement ("In X, Y group does Z").
-    """
     dfs = []
     for path, source_name in [(REDDIT_PATH, "culturebank_reddit"),
                                (TIKTOK_PATH, "culturebank_tiktok")]:
@@ -123,7 +154,7 @@ def load_norms() -> pd.DataFrame:
         df = df[df["agreement"] >= AGREEMENT_THRESH].copy()
         print(f"[{source_name}] After agreement >= {AGREEMENT_THRESH}: {len(df)}")
 
-        df["sentence"] = df["eval_whole_desc"].apply(first_sentence)
+        df["sentence"] = df.apply(build_norm_sentence, axis=1)
         df["cultural_group"] = df["cultural group"].apply(
             lambda x: clean_text(str(x)) if pd.notna(x) else "unknown"
         )

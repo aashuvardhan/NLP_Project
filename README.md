@@ -49,6 +49,9 @@ notebooks/01_data_exploration.ipynb
 
 # Step 3 — Train your assigned model
 python src/transformer_model.py --model deberta
+
+# On Google Colab
+!python src/transformer_model.py --model deberta
 ```
 
 ---
@@ -58,7 +61,7 @@ python src/transformer_model.py --model deberta
 ### 1. Install dependencies
 
 ```bash
-pip install torch transformers scikit-learn pandas numpy matplotlib seaborn sentencepiece protobuf
+pip install -r requirements.txt
 ```
 
 > **Note:** `sentencepiece` and `protobuf` are required for DeBERTa.
@@ -88,10 +91,29 @@ python src/transformer_model.py --model bert
 python src/transformer_model.py --model roberta
 ```
 
+**On Google Colab** (prefix with `!`):
+
+```python
+# DeBERTa-v3
+!python src/transformer_model.py --model deberta
+
+# BERT
+!python src/transformer_model.py --model bert
+
+# RoBERTa
+!python src/transformer_model.py --model roberta
+```
+
 ### Train all models on one machine
 
 ```bash
 python src/transformer_model.py --model all
+```
+
+**On Google Colab:**
+
+```python
+!python src/transformer_model.py --model all
 ```
 
 ---

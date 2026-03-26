@@ -192,7 +192,7 @@ python src/transformer_model.py --model mymodel
 
 **Sources used:**
 - **Norm:** CultureBank Reddit + TikTok (filtered: agreement >= 0.70)
-- **Non-Norm:** GenericsKB SimpleWiki + Best (filtered: quality score >= 0.55)
+- **Non-Norm:** Wikipedia (~20–25K sentences, keyword-filtered to remove cultural/behavioral sentences)
 
 ---
 

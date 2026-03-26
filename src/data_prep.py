@@ -9,8 +9,8 @@ Sources:
     - culturebank_tiktok.csv   → actor_behavior, agreement >= 0.7
 
   NON-NORM (label=0):
-    - generic_kb_simplewiki.parquet  → sentence, bert_score >= 0.23
-    - generics_kb_best.parquet       → generic_sentence, score >= 0.55
+    - wikipedia.parquet        → sentence column, ~20-25K sentences
+                                 (keyword-filtered to remove cultural/behavioral sentences)
 
 Output:
   data/train.csv, data/val.csv, data/test.csv  (80 / 10 / 10 split)
@@ -31,37 +31,45 @@ os.makedirs(DATA_OUT, exist_ok=True)
 
 REDDIT_PATH     = os.path.join(RAW_DIR, "culturebank_reddit.csv")
 TIKTOK_PATH     = os.path.join(RAW_DIR, "culturebank_tiktok.csv")
-SIMPLEWIKI_PATH = os.path.join(RAW_DIR, "generic_kb_simplewiki.parquet")
-GENERICS_PATH   = os.path.join(RAW_DIR, "generics_kb_best.parquet")
+WIKIPEDIA_PATH  = os.path.join(RAW_DIR, "wikipedia.parquet")
 
 # ─── Config ───────────────────────────────────────────────────────────────────
-AGREEMENT_THRESH  = 0.70   # CultureBank quality filter
-BERT_SCORE_THRESH = 0.23   # SimpleWiki quality filter
-GENERIC_SCORE_THRESH = 0.55  # GenericsKB best quality filter
+AGREEMENT_THRESH = 0.70   # CultureBank quality filter
 
 MIN_WORDS = 5
 MAX_WORDS = 80
 
 RANDOM_SEED = 42
 
+# Keywords that indicate a sentence is culturally/behaviorally normative.
+# Sentences containing any of these are removed from the Wikipedia non-norm set.
+NORM_KEYWORDS = [
+    "should", "must", "expected to", "it is customary",
+    "it is common to", "traditionally", "norm", "etiquette",
+    "polite", "rude", "respectful", "greeting", "bow", "tip",
+]
+
 # ─── Text cleaning ────────────────────────────────────────────────────────────
 def clean_text(text: str) -> str:
     if not isinstance(text, str):
         return ""
     text = text.strip()
-    # collapse multiple spaces/newlines
     text = re.sub(r'\s+', ' ', text)
-    # remove non-ASCII junk but keep punctuation
     text = re.sub(r'[^\x00-\x7F]+', ' ', text)
     text = text.strip()
     return text
 
 def is_valid(text: str) -> bool:
-    """Keep sentences that have between MIN_WORDS and MAX_WORDS words."""
+    """Keep sentences with between MIN_WORDS and MAX_WORDS words."""
     if not text:
         return False
     words = text.split()
     return MIN_WORDS <= len(words) <= MAX_WORDS
+
+def is_clean_non_norm(sentence: str) -> bool:
+    """Return True if sentence contains no norm-like keywords."""
+    sentence_lower = sentence.lower()
+    return not any(kw in sentence_lower for kw in NORM_KEYWORDS)
 
 # ─── Load NORM data ───────────────────────────────────────────────────────────
 def load_norms() -> pd.DataFrame:
@@ -71,19 +79,16 @@ def load_norms() -> pd.DataFrame:
         df = pd.read_csv(path)
         print(f"[{source_name}] Raw rows: {len(df)}")
 
-        # quality filter
         df = df[df["agreement"] >= AGREEMENT_THRESH].copy()
         print(f"[{source_name}] After agreement >= {AGREEMENT_THRESH}: {len(df)}")
 
-        # use actor_behavior as the norm sentence
         df["sentence"]       = df["actor_behavior"].apply(clean_text)
         df["cultural_group"] = df["cultural group"].apply(
             lambda x: clean_text(str(x)) if pd.notna(x) else "unknown"
         )
-        df["source"]  = source_name
-        df["label"]   = 1
+        df["source"] = source_name
+        df["label"]  = 1
 
-        # drop rows where sentence is empty or too short/long
         df = df[df["sentence"].apply(is_valid)]
         print(f"[{source_name}] After length filter: {len(df)}")
 
@@ -96,68 +101,44 @@ def load_norms() -> pd.DataFrame:
 
 # ─── Load NON-NORM data ───────────────────────────────────────────────────────
 def load_non_norms(target_count: int) -> pd.DataFrame:
-    dfs = []
+    wiki = pd.read_parquet(WIKIPEDIA_PATH)
+    print(f"\n[wikipedia] Raw rows: {len(wiki)}")
 
-    # --- SimpleWiki ---
-    sw = pd.read_parquet(SIMPLEWIKI_PATH)
-    print(f"\n[simplewiki] Raw rows: {len(sw)}")
-    sw = sw[sw["bert_score"] >= BERT_SCORE_THRESH].copy()
-    print(f"[simplewiki] After bert_score >= {BERT_SCORE_THRESH}: {len(sw)}")
-    sw["sentence"] = sw["sentence"].apply(clean_text)
-    sw = sw[sw["sentence"].apply(is_valid)]
-    sw["label"]          = 0
-    sw["cultural_group"] = "none"
-    sw["source"]         = "simplewiki"
-    dfs.append(sw[["sentence", "label", "cultural_group", "source"]])
-    print(f"[simplewiki] After length filter: {len(sw)}")
+    wiki["sentence"] = wiki["sentence"].apply(clean_text)
 
-    simplewiki_count = len(sw)
+    # Length filter
+    wiki = wiki[wiki["sentence"].apply(is_valid)]
+    print(f"[wikipedia] After length filter: {len(wiki)}")
 
-    # --- GenericsKB best ---
-    remaining = target_count - simplewiki_count
-    print(f"\n[generics_best] Need {remaining} more non-norm rows...")
+    # Keyword filter — remove sentences that look like norms
+    wiki = wiki[wiki["sentence"].apply(is_clean_non_norm)]
+    print(f"[wikipedia] After keyword filter: {len(wiki)}")
 
-    gb = pd.read_parquet(GENERICS_PATH, columns=["generic_sentence", "score", "source"])
-    print(f"[generics_best] Raw rows: {len(gb)}")
-    gb = gb[gb["score"] >= GENERIC_SCORE_THRESH].copy()
-    print(f"[generics_best] After score >= {GENERIC_SCORE_THRESH}: {len(gb)}")
+    # Sample to match norm count (target ~20-25K, capped by what's available)
+    sample_n = min(target_count, len(wiki))
+    wiki = wiki.sample(n=sample_n, random_state=RANDOM_SEED)
+    print(f"[wikipedia] Sampled: {len(wiki)}")
 
-    gb["sentence"] = gb["generic_sentence"].apply(clean_text)
-    gb = gb[gb["sentence"].apply(is_valid)]
-    print(f"[generics_best] After length filter: {len(gb)}")
+    wiki = wiki.drop_duplicates(subset="sentence")
+    wiki["label"]          = 0
+    wiki["cultural_group"] = "none"
+    wiki["source"]         = "wikipedia"
 
-    # Sample to fill the gap (stratified across sources for diversity)
-    if len(gb) > remaining:
-        gb = gb.groupby("source", group_keys=False).apply(
-            lambda x: x.sample(frac=min(1.0, remaining / len(gb)), random_state=RANDOM_SEED)
-        )
-        # in case we got a bit more or less, trim or top-up simply
-        if len(gb) > remaining:
-            gb = gb.sample(n=remaining, random_state=RANDOM_SEED)
-
-    gb_out = gb[["sentence"]].copy()
-    gb_out["label"]          = 0
-    gb_out["cultural_group"] = "none"
-    gb_out["source"]         = "generics_kb_best"
-    dfs.append(gb_out)
-    print(f"[generics_best] Sampled: {len(gb_out)}")
-
-    non_norms = pd.concat(dfs, ignore_index=True)
-    non_norms = non_norms.drop_duplicates(subset="sentence")
-    print(f"\nTotal NON-NORM rows (deduplicated): {len(non_norms)}")
-    return non_norms
+    print(f"\nTotal NON-NORM rows (deduplicated): {len(wiki)}")
+    return wiki[["sentence", "label", "cultural_group", "source"]]
 
 # ─── Merge & split ────────────────────────────────────────────────────────────
 def build_dataset():
     norms     = load_norms()
-    non_norms = load_non_norms(target_count=len(norms))   # aim for 1:1 balance
+    non_norms = load_non_norms(target_count=len(norms))   # 1:1 balance
 
-    # final balance check – trim majority class to exact 1:1
-    n = min(len(norms), len(non_norms))
+    # Trim majority class to exact 1:1
+    n         = min(len(norms), len(non_norms))
     norms     = norms.sample(n=n, random_state=RANDOM_SEED)
     non_norms = non_norms.sample(n=n, random_state=RANDOM_SEED)
 
     merged = pd.concat([norms, non_norms], ignore_index=True)
+    # Shuffle so norms and non-norms are fully interleaved (no clusters)
     merged = merged.sample(frac=1, random_state=RANDOM_SEED).reset_index(drop=True)
 
     print(f"\n{'='*50}")
@@ -167,7 +148,6 @@ def build_dataset():
     print(f"  Sources: {merged['source'].value_counts().to_dict()}")
     print(f"{'='*50}\n")
 
-    # Save full merged
     merged.to_csv(os.path.join(DATA_OUT, "merged_full.csv"), index=False)
     print("Saved -> data/merged_full.csv")
 

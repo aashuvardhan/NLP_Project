@@ -278,7 +278,7 @@ def train_model(model_key: str, train_df, val_df, test_df, cfg: dict):
 
     model = AutoModelForSequenceClassification.from_pretrained(
         model_name, num_labels=2, ignore_mismatched_sizes=True
-    ).to(DEVICE)
+    ).to(DEVICE).float()  # DeBERTa-v3 can load some params as FP16; force FP32 so GradScaler works
 
     total_steps  = (len(train_loader) // cfg["grad_accumulation"]) * cfg["epochs"]
     warmup_steps = int(total_steps * cfg["warmup_ratio"])

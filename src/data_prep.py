@@ -6,12 +6,20 @@ Builds the final merged dataset for the P3 Norm Classifier project.
 Sources:
   NORM (label=1):
     - culturebank_reddit.csv  → constructed from context + cultural_group + actor_behavior
-    - culturebank_tiktok.csv  → same, agreement >= 0.7
+    - culturebank_tiktok.csv  → same, agreement >= 0.7, topic in KEEP_TOPICS
     Two sentence templates used (50/50) to break structural shortcut:
       Template A: "In {context}, {group} {behavior}."
       Template B: "{group} {behavior} in {context}."
+    Rows with ambiguous/observational topics (culture shock, cultural exchange)
+    are excluded per CultureBank paper limitations section.
 
   NON-NORM / Hard Negatives (label=0):
+    - culturebank (agreement <= 0.2)  → HARDEST negatives: structurally identical
+                                         to norm sentences ("In X, Y does Z.") but
+                                         explicitly labeled non-norm in source data.
+                                         Eliminates all three known shortcuts at once:
+                                         cultural group name, behavioral verb, sentence
+                                         structure. See Key Insight 6 in analysis.
     - stereotype.parquet       → StereoSet anti-stereotype sentences (gold_label=1)
                                  combined with context; contains cultural groups + behavior
     - crows_pairs_anonymized.csv → CrowS-Pairs sent_less column only
@@ -48,17 +56,60 @@ SQUAD_PATH       = os.path.join(RAW_DIR, "squad.parquet")
 WIKIPEDIA_PATH   = os.path.join(RAW_DIR, "wikipedia.parquet")
 
 # ─── Config ───────────────────────────────────────────────────────────────────
-AGREEMENT_THRESH = 0.70
-MIN_WORDS        = 5
-MAX_WORDS        = 80
-RANDOM_SEED      = 42
+AGREEMENT_THRESH     = 0.70
+HARD_NEG_THRESH      = 0.20   # CultureBank rows at or below this are explicit non-norms
+MIN_WORDS            = 5
+MAX_WORDS            = 80
+RANDOM_SEED          = 42
 
 # Sentences with any of these are too norm-like for the non-norm set.
+# NOTE: NOT applied to CultureBank hard negatives — those must look like norms.
 NORM_KEYWORDS = [
     "should", "must", "expected to", "it is customary",
     "it is common to", "traditionally", "norm", "etiquette",
     "polite", "rude", "respectful", "greeting", "bow", "tip",
 ]
+
+# Topics to KEEP for norm rows — clear, prescriptive behavioral categories.
+# Excluded per CultureBank paper limitations: "Cultural Exchange", "Migration and
+# Cultural Adaptation", and "Cultural and Environmental Appreciation" describe
+# reactions/observations (culture shock) rather than prescriptive behavioral norms.
+# Topic strings match the actual values in the CSV exactly.
+KEEP_TOPICS = {
+    "Social Norms and Etiquette",
+    "Community and Identity",
+    "Food and Dining",
+    "Communication and Language",
+    "Cultural Traditions and Festivals",
+    "Miscellaneous",
+    "Consumer Behavior",
+    "Health and Hygiene",
+    "Finance and Economy",
+    "Entertainment and Leisure",
+    "Education and Technology",
+    "Family Dynamics",
+    "Social Interactions",
+    "Relationships and Marriage",
+    "Lifestyles",
+    "Family Traditions and Heritage",
+    "Household and Daily Life",
+    "Drinking and Alcohol",
+    "Beauty and Fashion",
+    "Safety and Security",
+    "Workplace",
+    "Work-Life Balance",
+    "Religious Practices",
+    "Sports and Recreation",
+    "Transportation",
+    "Time Management and Punctuality",
+    "Travelling",
+    "Social Infrastructure",
+    "Pet and Animal Care",
+    "Humor and Storytelling",
+    "Dress Codes",
+    "Housing and Interior Design",
+    "Environmental Adaptation and Sustainability",
+}
 
 # ─── Text helpers ─────────────────────────────────────────────────────────────
 def clean_text(text: str) -> str:
@@ -144,6 +195,12 @@ def load_norms() -> pd.DataFrame:
         df = df[df["agreement"] >= AGREEMENT_THRESH].copy()
         print(f"[{source_name}] After agreement >= {AGREEMENT_THRESH}: {len(df)}")
 
+        # Drop observational/culture-shock topics — these describe reactions, not norms
+        if "topic" in df.columns:
+            before = len(df)
+            df = df[df["topic"].isin(KEEP_TOPICS)].copy()
+            print(f"[{source_name}] After topic filter: {len(df)}  (removed {before - len(df)} observational rows)")
+
         # Assign templates 50/50 by row position (deterministic, no shuffle needed)
         df = df.reset_index(drop=True)
         df["_tmpl"] = df.index.map(lambda i: "A" if i % 2 == 0 else "B")
@@ -167,6 +224,53 @@ def load_norms() -> pd.DataFrame:
 
 
 # ─── NON-NORM data (Hard Negatives) ──────────────────────────────────────────
+def load_culturebank_hard_negatives() -> pd.DataFrame:
+    """
+    CultureBank rows with agreement <= 0.20 become label=0.
+
+    Why this is the most powerful hard negative source:
+      - Built with the SAME build_norm_sentence templates as the norm rows.
+      - Contains the same cultural group names, behavioral verbs, and "In X, Y does Z."
+        sentence structure as the positive class.
+      - Yet the CultureBank paper explicitly marks these as non-norms: "if agreement <= 0.2,
+        the behavior is NOT the norm for that group."
+      - Example: "In restaurants, Americans do not tip service staff." agreement=0 → label=0
+        vs. "In restaurants, Americans tip 15-20%." agreement=1 → label=1
+      - Forces the model to learn prescriptive vs. descriptive meaning, not shortcuts.
+
+    Topic filter applied: same KEEP_TOPICS as norm rows so that the only difference
+    between positive and negative examples is the agreement value, not the topic.
+    """
+    dfs = []
+    for path, source_name in [(REDDIT_PATH, "culturebank_reddit_hardneg"),
+                               (TIKTOK_PATH, "culturebank_tiktok_hardneg")]:
+        df = pd.read_csv(path)
+        df = df[df["agreement"] <= HARD_NEG_THRESH].copy()
+        print(f"[{source_name}] Rows with agreement <= {HARD_NEG_THRESH}: {len(df)}")
+
+        if "topic" in df.columns:
+            df = df[df["topic"].isin(KEEP_TOPICS)].copy()
+            print(f"[{source_name}] After topic filter: {len(df)}")
+
+        df = df.reset_index(drop=True)
+        df["_tmpl"] = df.index.map(lambda i: "A" if i % 2 == 0 else "B")
+        df["sentence"] = df.apply(lambda r: build_norm_sentence(r, r["_tmpl"]), axis=1)
+
+        df["cultural_group"] = df["cultural group"].apply(
+            lambda x: clean_text(str(x)) if pd.notna(x) else "unknown"
+        )
+        df["source"] = source_name
+        df["label"]  = 0
+
+        df = df[df["sentence"].apply(is_valid)]
+        dfs.append(df[["sentence", "label", "cultural_group", "source"]])
+
+    hard_negs = pd.concat(dfs, ignore_index=True)
+    hard_negs = hard_negs.drop_duplicates(subset="sentence")
+    print(f"\nTotal CultureBank hard negatives (deduplicated): {len(hard_negs)}")
+    return hard_negs
+
+
 def load_stereoset() -> pd.DataFrame:
     """
     StereoSet — anti-stereotype sentences (gold_label=1) combined with context.
@@ -340,19 +444,21 @@ def load_wikipedia(target_n: int) -> pd.DataFrame:
 
 def load_non_norms(target_count: int) -> pd.DataFrame:
     """
-    Non-norm budget:
-      StereoSet  — all available (~700)    : highest-quality hard negatives
-      CrowS-Pairs — all available (~1,400)  : cultural group + behavioral sentences
-      SQuAD      — fills ~30% of remainder  : factual human-activity passages
-      Wikipedia  — fills ~70% of remainder  : structural + general factual sentences
+    Non-norm budget (priority order):
+      CultureBank hard neg — all available  : HARDEST negatives; same structure/vocab
+                                              as norm sentences but agreement <= 0.2
+      StereoSet            — all available  : cultural group + behavior, not prescriptive
+      CrowS-Pairs          — all available  : cultural group + behavior, less-stereotyping
+      SQuAD                — fills ~30% of remainder : factual human-activity passages
+      Wikipedia            — fills ~70% of remainder : structural + general factual sentences
 
-    StereoSet and CrowS-Pairs are used in full (they're small but high quality).
-    SQuAD and Wikipedia fill up to the target.
+    The first three are used in full. SQuAD and Wikipedia fill up to the target.
     """
-    stereo_df = load_stereoset()
-    crows_df  = load_crows_pairs()
+    cb_hard_df = load_culturebank_hard_negatives()
+    stereo_df  = load_stereoset()
+    crows_df   = load_crows_pairs()
 
-    filled    = len(stereo_df) + len(crows_df)
+    filled    = len(cb_hard_df) + len(stereo_df) + len(crows_df)
     remaining = max(0, target_count - filled)
     sq_n      = remaining // 3
     wiki_n    = remaining - sq_n
@@ -360,7 +466,7 @@ def load_non_norms(target_count: int) -> pd.DataFrame:
     sq_df   = load_squad(sq_n)
     wiki_df = load_wikipedia(wiki_n)
 
-    non_norms = pd.concat([stereo_df, crows_df, sq_df, wiki_df], ignore_index=True)
+    non_norms = pd.concat([cb_hard_df, stereo_df, crows_df, sq_df, wiki_df], ignore_index=True)
     non_norms = non_norms.drop_duplicates(subset="sentence")
     print(f"\nTotal NON-NORM rows (deduplicated): {len(non_norms)}")
     return non_norms

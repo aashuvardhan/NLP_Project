@@ -5,27 +5,22 @@ Builds the final merged dataset for the P3 Norm Classifier project.
 
 Sources:
   NORM (label=1):
-    - culturebank_reddit.csv  → constructed from context + cultural_group + actor_behavior
-    - culturebank_tiktok.csv  → same, agreement >= 0.7, topic in KEEP_TOPICS
-    Two sentence templates used (50/50) to break structural shortcut:
-      Template A: "In {context}, {group} {behavior}."
-      Template B: "{group} {behavior} in {context}."
-    Rows with ambiguous/observational topics (culture shock, cultural exchange)
-    are excluded per CultureBank paper limitations section.
+    - culturebank_reddit.csv           → context + cultural_group + actor_behavior, agreement >= 0.7
+    - culturebank_tiktok.csv           → same; KEEP_TOPICS filter removes observational rows
+    - normad_etiquette_final_data.csv  → Rule-of-Thumb where Gold Label == 'yes' (~900 rows)
+    - NormBank.csv                     → "In a {setting}, people {behavior}." where label in [1,2]
+    - cultureatlas.parquet             → positive_sample cultural statements (~3,100 rows)
 
   NON-NORM / Hard Negatives (label=0):
-    - culturebank (agreement <= 0.2)  → HARDEST negatives: structurally identical
-                                         to norm sentences ("In X, Y does Z.") but
-                                         explicitly labeled non-norm in source data.
-                                         Eliminates all three known shortcuts at once:
-                                         cultural group name, behavioral verb, sentence
-                                         structure. See Key Insight 6 in analysis.
-    - stereotype.parquet       → StereoSet anti-stereotype sentences (gold_label=1)
-                                 combined with context; contains cultural groups + behavior
-    - crows_pairs_anonymized.csv → CrowS-Pairs sent_less column only
-                                   (less-stereotyping side; cultural + behavioral)
-    - squad.parquet            → factual passages about human activities (sentence-split)
-    - wikipedia.parquet        → factual sentences (50% structural, 50% general)
+    - culturebank (agreement <= 0.2)  → HARDEST: same sentence structure as norms but
+                                         agreement explicitly marks behavior as non-norm
+    - NormBank.csv (label == 0)       → HARDEST: "In a {setting}, people {behavior}." where
+                                         behavior is taboo — identical structure to norm
+                                         sentences but opposite label
+    - stereotype.parquet              → StereoSet anti-stereotype sentences (cultural group + behavior)
+    - crows_pairs_anonymized.csv      → CrowS-Pairs sent_less (less-stereotyping sentences)
+    - squad.parquet                   → factual human-activity passages (sentence-split)
+    - wikipedia.parquet               → structural + general factual sentences
 
   AG News REMOVED — Reuters/AP formatting was a trivial non-norm signal.
 
@@ -48,12 +43,15 @@ RAW_DIR  = os.path.join(BASE, "data", "raw")
 DATA_OUT = os.path.join(BASE, "data")
 os.makedirs(DATA_OUT, exist_ok=True)
 
-REDDIT_PATH      = os.path.join(RAW_DIR, "culturebank_reddit.csv")
-TIKTOK_PATH      = os.path.join(RAW_DIR, "culturebank_tiktok.csv")
-STEREOSET_PATH   = os.path.join(RAW_DIR, "stereotype.parquet")
-CROWS_PATH       = os.path.join(RAW_DIR, "crows_pairs_anonymized.csv")
-SQUAD_PATH       = os.path.join(RAW_DIR, "squad.parquet")
-WIKIPEDIA_PATH   = os.path.join(RAW_DIR, "wikipedia.parquet")
+REDDIT_PATH       = os.path.join(RAW_DIR, "culturebank_reddit.csv")
+TIKTOK_PATH       = os.path.join(RAW_DIR, "culturebank_tiktok.csv")
+STEREOSET_PATH    = os.path.join(RAW_DIR, "stereotype.parquet")
+CROWS_PATH        = os.path.join(RAW_DIR, "crows_pairs_anonymized.csv")
+SQUAD_PATH        = os.path.join(RAW_DIR, "squad.parquet")
+WIKIPEDIA_PATH    = os.path.join(RAW_DIR, "wikipedia.parquet")
+NORMAD_PATH       = os.path.join(RAW_DIR, "normad_etiquette_final_data.csv")
+NORMBANK_PATH     = os.path.join(RAW_DIR, "NormBank.csv")
+CULTUREATLAS_PATH = os.path.join(RAW_DIR, "cultureatlas.parquet")
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 AGREEMENT_THRESH     = 0.70
@@ -61,6 +59,8 @@ HARD_NEG_THRESH      = 0.20   # CultureBank rows at or below this are explicit n
 MIN_WORDS            = 5
 MAX_WORDS            = 80
 RANDOM_SEED          = 42
+NORMBANK_NORM_CAP    = 8000   # max normal/expected NormBank rows added as norms
+NORMBANK_NEG_CAP     = 8000   # max taboo NormBank rows added as hard negatives
 
 # Sentences with any of these are too norm-like for the non-norm set.
 # NOTE: NOT applied to CultureBank hard negatives — those must look like norms.
@@ -219,8 +219,121 @@ def load_norms() -> pd.DataFrame:
 
     norms = pd.concat(dfs, ignore_index=True)
     norms = norms.drop_duplicates(subset="sentence")
-    print(f"\nTotal NORM rows (deduplicated): {len(norms)}")
+    print(f"\nTotal CultureBank NORM rows (deduplicated): {len(norms)}")
     return norms
+
+
+def load_normad_norms() -> pd.DataFrame:
+    """
+    NormAd — Rule-of-Thumb sentences where Gold Label == 'yes'.
+
+    Each Rule-of-Thumb is an already-formed prescriptive norm statement, e.g.:
+      "It is respectful to greet everyone present before starting any social interaction."
+    These are clean, direct, culturally grounded norms across 75 countries.
+    Only 'yes'-labeled rows are used; 'no' rows describe norm violations and
+    'neutral' rows are ambiguous.
+    """
+    print(f"\n[normad] Loading from {NORMAD_PATH}...")
+    df = pd.read_csv(NORMAD_PATH)
+    print(f"[normad] Raw rows: {len(df)}")
+
+    df = df[df["Gold Label"] == "yes"].copy()
+    print(f"[normad] After Gold Label == 'yes': {len(df)}")
+
+    df["sentence"] = df["Rule-of-Thumb"].apply(clean_text)
+    df["cultural_group"] = df["Country"].apply(
+        lambda x: clean_text(str(x)) if pd.notna(x) else "unknown"
+    )
+    df["label"]  = 1
+    df["source"] = "normad"
+
+    df = df[df["sentence"].apply(is_valid)]
+    df = df.drop_duplicates(subset="sentence")
+    print(f"[normad] Final rows: {len(df)}")
+    return df[["sentence", "label", "cultural_group", "source"]]
+
+
+def load_normbank_norms() -> pd.DataFrame:
+    """
+    NormBank — 'normal' and 'expected' rows (label in [1, 2]) from train split.
+
+    Sentence construction: "In a {setting}, people {behavior}."
+    This mirrors the CultureBank Template A structure exactly, so NormBank norms
+    blend seamlessly with CultureBank norms in the training set.
+    Capped at NORMBANK_NORM_CAP rows to prevent NormBank from dominating the norm pool.
+    Train split only to avoid test contamination.
+    """
+    print(f"\n[normbank_norms] Loading from {NORMBANK_PATH}...")
+    df = pd.read_csv(NORMBANK_PATH)
+    print(f"[normbank_norms] Raw rows: {len(df)}")
+
+    df = df[(df["label"].isin([1, 2])) & (df["split"] == "train")].copy()
+    print(f"[normbank_norms] Normal/expected (train split): {len(df)}")
+
+    def build_nb_sentence(row):
+        setting  = clean_text(str(row.get("setting",  "")))
+        behavior = clean_text(str(row.get("behavior", "")))
+        if not behavior or behavior == "nan":
+            return ""
+        if setting and setting != "nan":
+            return f"In a {setting}, people {behavior}."
+        return f"People {behavior}."
+
+    df["sentence"] = df.apply(build_nb_sentence, axis=1)
+    df = df[df["sentence"].apply(is_valid)]
+    df = df.drop_duplicates(subset="sentence")
+
+    if len(df) > NORMBANK_NORM_CAP:
+        df = df.sample(n=NORMBANK_NORM_CAP, random_state=RANDOM_SEED)
+
+    df["cultural_group"] = "none"
+    df["label"]  = 1
+    df["source"] = "normbank"
+    print(f"[normbank_norms] Final rows: {len(df)}")
+    return df[["sentence", "label", "cultural_group", "source"]]
+
+
+def load_cultureatlas_norms() -> pd.DataFrame:
+    """
+    CultureAtlas — positive_sample cultural statements.
+
+    Each positive_sample is a complete, factually grounded sentence about a
+    specific cultural practice (dress, customs, rituals, etc.) for a named country.
+    e.g. "In some Pashtun cultures, a boy marks his start of adulthood by being
+          allowed to wear a turban, which holds special significance."
+    Country field maps to cultural_group.
+    """
+    print(f"\n[cultureatlas] Loading from {CULTUREATLAS_PATH}...")
+    df = pd.read_parquet(CULTUREATLAS_PATH)
+    print(f"[cultureatlas] Raw rows: {len(df)}")
+
+    df["sentence"] = df["positive_sample"].apply(clean_text)
+    df["cultural_group"] = df["country"].apply(
+        lambda x: clean_text(str(x)) if pd.notna(x) else "unknown"
+    )
+    df["label"]  = 1
+    df["source"] = "cultureatlas"
+
+    df = df[df["sentence"].apply(is_valid)]
+    df = df.drop_duplicates(subset="sentence")
+    print(f"[cultureatlas] Final rows: {len(df)}")
+    return df[["sentence", "label", "cultural_group", "source"]]
+
+
+def load_all_norms() -> pd.DataFrame:
+    """Merge all norm sources into one deduplicated DataFrame."""
+    cb_norms  = load_norms()
+    na_norms  = load_normad_norms()
+    nb_norms  = load_normbank_norms()
+    ca_norms  = load_cultureatlas_norms()
+
+    all_norms = pd.concat([cb_norms, na_norms, nb_norms, ca_norms], ignore_index=True)
+    all_norms = all_norms.drop_duplicates(subset="sentence")
+    print(f"\n{'='*50}")
+    print(f"TOTAL NORM ROWS (all sources, deduplicated): {len(all_norms)}")
+    print(f"  {all_norms['source'].value_counts().to_dict()}")
+    print(f"{'='*50}\n")
+    return all_norms
 
 
 # ─── NON-NORM data (Hard Negatives) ──────────────────────────────────────────
@@ -269,6 +382,49 @@ def load_culturebank_hard_negatives() -> pd.DataFrame:
     hard_negs = hard_negs.drop_duplicates(subset="sentence")
     print(f"\nTotal CultureBank hard negatives (deduplicated): {len(hard_negs)}")
     return hard_negs
+
+
+def load_normbank_hard_negatives() -> pd.DataFrame:
+    """
+    NormBank taboo rows (label == 0) as hard negatives.
+
+    Sentence construction is IDENTICAL to load_normbank_norms():
+      "In a {setting}, people {behavior}."
+    The only difference between these and norm sentences is the label.
+    e.g. NORM:     "In a restaurant, people pay the bill before leaving."   label=1
+         HARD NEG: "In a restaurant, people walk out without paying."       label=0
+
+    This is structurally the hardest possible non-norm — same template, same vocab
+    domain, different prescriptive meaning. Forces the model to reason semantically.
+    Capped at NORMBANK_NEG_CAP. Train split only.
+    """
+    print(f"\n[normbank_hardneg] Loading from {NORMBANK_PATH}...")
+    df = pd.read_csv(NORMBANK_PATH)
+
+    df = df[(df["label"] == 0) & (df["split"] == "train")].copy()
+    print(f"[normbank_hardneg] Taboo rows (train split): {len(df)}")
+
+    def build_nb_sentence(row):
+        setting  = clean_text(str(row.get("setting",  "")))
+        behavior = clean_text(str(row.get("behavior", "")))
+        if not behavior or behavior == "nan":
+            return ""
+        if setting and setting != "nan":
+            return f"In a {setting}, people {behavior}."
+        return f"People {behavior}."
+
+    df["sentence"] = df.apply(build_nb_sentence, axis=1)
+    df = df[df["sentence"].apply(is_valid)]
+    df = df.drop_duplicates(subset="sentence")
+
+    if len(df) > NORMBANK_NEG_CAP:
+        df = df.sample(n=NORMBANK_NEG_CAP, random_state=RANDOM_SEED)
+
+    df["cultural_group"] = "none"
+    df["label"]  = 0
+    df["source"] = "normbank_taboo"
+    print(f"[normbank_hardneg] Final rows: {len(df)}")
+    return df[["sentence", "label", "cultural_group", "source"]]
 
 
 def load_stereoset() -> pd.DataFrame:
@@ -444,21 +600,20 @@ def load_wikipedia(target_n: int) -> pd.DataFrame:
 
 def load_non_norms(target_count: int) -> pd.DataFrame:
     """
-    Non-norm budget (priority order):
-      CultureBank hard neg — all available  : HARDEST negatives; same structure/vocab
-                                              as norm sentences but agreement <= 0.2
-      StereoSet            — all available  : cultural group + behavior, not prescriptive
-      CrowS-Pairs          — all available  : cultural group + behavior, less-stereotyping
-      SQuAD                — fills ~30% of remainder : factual human-activity passages
-      Wikipedia            — fills ~70% of remainder : structural + general factual sentences
-
-    The first three are used in full. SQuAD and Wikipedia fill up to the target.
+    Non-norm budget (priority order, all fixed sources used in full):
+      CultureBank hard neg  — agreement <= 0.2, same template as norms
+      NormBank taboo        — label==0, same "In a {setting}, people {behavior}." template
+      StereoSet             — cultural group + behavior, not prescriptive
+      CrowS-Pairs           — cultural group + behavior, less-stereotyping
+      SQuAD                 — fills ~30% of remainder
+      Wikipedia             — fills ~70% of remainder (50% structural, 50% general)
     """
     cb_hard_df = load_culturebank_hard_negatives()
+    nb_hard_df = load_normbank_hard_negatives()
     stereo_df  = load_stereoset()
     crows_df   = load_crows_pairs()
 
-    filled    = len(cb_hard_df) + len(stereo_df) + len(crows_df)
+    filled    = len(cb_hard_df) + len(nb_hard_df) + len(stereo_df) + len(crows_df)
     remaining = max(0, target_count - filled)
     sq_n      = remaining // 3
     wiki_n    = remaining - sq_n
@@ -466,7 +621,10 @@ def load_non_norms(target_count: int) -> pd.DataFrame:
     sq_df   = load_squad(sq_n)
     wiki_df = load_wikipedia(wiki_n)
 
-    non_norms = pd.concat([cb_hard_df, stereo_df, crows_df, sq_df, wiki_df], ignore_index=True)
+    non_norms = pd.concat(
+        [cb_hard_df, nb_hard_df, stereo_df, crows_df, sq_df, wiki_df],
+        ignore_index=True
+    )
     non_norms = non_norms.drop_duplicates(subset="sentence")
     print(f"\nTotal NON-NORM rows (deduplicated): {len(non_norms)}")
     return non_norms
@@ -478,7 +636,7 @@ def build_dataset():
     print("  P3 Norm Classifier — Data Preparation")
     print("="*60 + "\n")
 
-    norms     = load_norms()
+    norms     = load_all_norms()
     non_norms = load_non_norms(target_count=len(norms))
 
     # Trim to exact 1:1 balance

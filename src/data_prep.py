@@ -293,6 +293,34 @@ def load_normbank_norms() -> pd.DataFrame:
     return df[["sentence", "label", "cultural_group", "source"]]
 
 
+
+# Patterns that signal encyclopedic / historical / non-norm text in CultureAtlas.
+# These entries were mislabeled as norms during error analysis — the trained
+# DeBERTa model confidently rejected them as non-norms and it was right.
+_CA_BAD_PATTERNS = [
+    re.compile(r'\b(1[0-9]{3}|20[0-9]{2})\b'),          # 4-digit year → historical fact
+    re.compile(r'[\n\r]'),                                # newlines → dictionary/list artifacts
+    re.compile(r'\brefers to\b', re.I),                  # encyclopedic definitions
+    re.compile(r'\bis defined as\b', re.I),              # encyclopedic definitions
+    re.compile(r'\b(passed|enacted)\b.{0,50}\b(acts?|laws?|bills?|resolution)\b', re.I),
+    re.compile(r'\b(acts?|laws?|bills?|resolution)\b.{0,50}\b(passed|enacted)\b', re.I),
+    re.compile(r'\b(parliament|congress|legislature)\b.{0,60}\b(pass|enact|establish)\w*\b', re.I),
+    re.compile(r'^\s*\d+[:\.]'),                         # starts with number/code (e.g. "48: ...")
+    re.compile(r'\b[A-Z][a-z]+,\s+a [a-z]+\s+(writer|scholar|researcher|professor|sociologist)\b'),
+    re.compile(r'\b[A-Z][a-z]+\s+(defines?|observes?|associate\w*|notes?|argue\w*|claim\w*)\b'),
+    re.compile(r'\b(were|was)\s+(ruled|governed|controlled|administered)\s+by\b', re.I),
+    re.compile(r'\b(prohibited|forbade|banned|outlawed)\b.{0,40}\b(acquisition|trading|slavery|slaves?)\b', re.I),
+]
+
+def _is_valid_cultureatlas(sentence: str) -> bool:
+    """Return True only if the sentence looks like a cultural norm/practice,
+    not an encyclopedic fact, historical event, or academic definition."""
+    for pat in _CA_BAD_PATTERNS:
+        if pat.search(sentence):
+            return False
+    return True
+
+
 def load_cultureatlas_norms() -> pd.DataFrame:
     """
     CultureAtlas — positive_sample cultural statements.
@@ -302,6 +330,11 @@ def load_cultureatlas_norms() -> pd.DataFrame:
     e.g. "In some Pashtun cultures, a boy marks his start of adulthood by being
           allowed to wear a turban, which holds special significance."
     Country field maps to cultural_group.
+
+    Fix (error analysis): Added _is_valid_cultureatlas() to remove encyclopedic /
+    historical / definitional entries that were mislabeled as norms. The trained
+    DeBERTa model confidently rejected these as non-norms — correctly — revealing
+    a labeling noise issue in the raw parquet.
     """
     print(f"\n[cultureatlas] Loading from {CULTUREATLAS_PATH}...")
     df = pd.read_parquet(CULTUREATLAS_PATH)
@@ -315,6 +348,9 @@ def load_cultureatlas_norms() -> pd.DataFrame:
     df["source"] = "cultureatlas"
 
     df = df[df["sentence"].apply(is_valid)]
+    before = len(df)
+    df = df[df["sentence"].apply(_is_valid_cultureatlas)]
+    print(f"[cultureatlas] After encyclopedic/historical filter: {len(df)}  (removed {before - len(df)} bad entries)")
     df = df.drop_duplicates(subset="sentence")
     print(f"[cultureatlas] Final rows: {len(df)}")
     return df[["sentence", "label", "cultural_group", "source"]]

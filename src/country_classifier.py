@@ -956,8 +956,8 @@ def main():
     parser.add_argument("--lr",               type=float, default=DEFAULT_CFG["learning_rate"])
     parser.add_argument("--max_length",       type=int,   default=DEFAULT_CFG["max_length"])
     parser.add_argument("--min_samples",      type=int,   default=DEFAULT_CFG["min_samples"])
-    parser.add_argument("--norm_threshold",   type=float, default=0.5,
-                        help="Confidence threshold for norm classification (default: 0.5)")
+    parser.add_argument("--norm_threshold",   type=float, default=0.6,
+                        help="Confidence threshold for norm classification (default: 0.6)")
     parser.add_argument("--norm_model",       type=str,   default="deberta",
                         choices=list(NORM_MODEL_DIRS.keys()),
                         help="Which norm classifier checkpoint to use (default: deberta).\n"
@@ -1033,7 +1033,7 @@ def main():
         results  = pipeline.predict(sentences)
 
         print(f"\n{'─'*80}")
-        print(f"{'SENTENCE':<45} {'NORM':>6}  {'CONF':>6}  {'COUNTRY':<30} {'CONF':>6}")
+        print(f"{'SENTENCE':<45} {'NORM':>6}  {'CONF':>6}  {'COUNTRY':<30} {'CONFIDENCE SCORE':>6}")
         print(f"{'─'*80}")
         for r in results:
             snippet  = r["sentence"][:44]

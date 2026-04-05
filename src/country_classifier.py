@@ -64,7 +64,17 @@ DATA_DIR         = os.path.join(BASE, "data")
 RESULTS_DIR      = os.path.join(BASE, "results", "country")
 PLOTS_DIR        = os.path.join(RESULTS_DIR, "plots")
 COUNTRY_MDL_DIR  = os.path.join(BASE, "saved_models", "country_best")
-NORM_MDL_DIR     = os.path.join(BASE, "saved_models", "deberta_best")   # norm classifier
+
+# Norm classifier checkpoints — one per backbone (matches transformer_model.py naming)
+NORM_MODEL_DIRS = {
+    "deberta":       os.path.join(BASE, "saved_models", "deberta_best"),
+    "bert":          os.path.join(BASE, "saved_models", "bert_best"),
+    "roberta":       os.path.join(BASE, "saved_models", "roberta_best"),
+    "deberta_large": os.path.join(BASE, "saved_models", "large_models", "deberta_large_best"),
+    "roberta_large": os.path.join(BASE, "saved_models", "large_models", "roberta_large_best"),
+    "bert_large":    os.path.join(BASE, "saved_models", "large_models", "bert_large_best"),
+}
+NORM_MDL_DIR = NORM_MODEL_DIRS["deberta"]   # default
 
 for d in [RESULTS_DIR, PLOTS_DIR, COUNTRY_MDL_DIR]:
     os.makedirs(d, exist_ok=True)
@@ -820,25 +830,48 @@ class NormCountryPipeline:
         self.device         = device
         self.norm_threshold = norm_threshold
 
-        print(f"Loading norm classifier from   : {norm_model_dir}")
-        self.norm_tokenizer = AutoTokenizer.from_pretrained(norm_model_dir)
-        self.norm_model     = AutoModelForSequenceClassification.from_pretrained(
-            norm_model_dir).to(device).eval()
+        # ── Pre-flight checks ──────────────────────────────────────────────
+        if not os.path.isdir(norm_model_dir):
+            raise FileNotFoundError(
+                f"\nNorm model not found at: {norm_model_dir}\n"
+                "Train the norm classifier first:\n"
+                "  python src/transformer_model.py --model deberta\n"
+                "Or pass the correct path:\n"
+                "  python src/country_classifier.py --mode predict "
+                "--norm_model_dir /your/path/to/deberta_best"
+            )
+        if not os.path.isfile(os.path.join(norm_model_dir, "config.json")):
+            raise FileNotFoundError(
+                f"config.json missing in {norm_model_dir}. "
+                "The checkpoint may be incomplete — retrain the norm classifier."
+            )
 
         label_map_path = os.path.join(country_model_dir, "label_map.json")
-        if not os.path.exists(label_map_path):
+        if not os.path.isdir(country_model_dir) or not os.path.exists(label_map_path):
             raise FileNotFoundError(
-                f"label_map.json not found at {label_map_path}. "
-                "Run:  python src/country_classifier.py --mode train  first."
+                f"\nCountry model not found at: {country_model_dir}\n"
+                "Train the country classifier first:\n"
+                "  python src/country_classifier.py --mode train"
             )
+
+        # ── Load norm classifier ───────────────────────────────────────────
+        print(f"Loading norm classifier from   : {norm_model_dir}")
+        self.norm_tokenizer = AutoTokenizer.from_pretrained(
+            norm_model_dir, local_files_only=True)
+        self.norm_model     = AutoModelForSequenceClassification.from_pretrained(
+            norm_model_dir, local_files_only=True).to(device).eval()
+
+        # ── Load country label map ─────────────────────────────────────────
         with open(label_map_path) as f:
             maps = json.load(f)
         self.id2label = {int(k): v for k, v in maps["id2label"].items()}
 
+        # ── Load country classifier ────────────────────────────────────────
         print(f"Loading country classifier from : {country_model_dir}")
-        self.country_tokenizer = AutoTokenizer.from_pretrained(country_model_dir)
+        self.country_tokenizer = AutoTokenizer.from_pretrained(
+            country_model_dir, local_files_only=True)
         self.country_model     = AutoModelForSequenceClassification.from_pretrained(
-            country_model_dir).to(device).eval()
+            country_model_dir, local_files_only=True).to(device).eval()
 
         print(f"Pipeline ready. {len(self.id2label)} country classes | norm threshold={norm_threshold}\n")
 
@@ -925,6 +958,19 @@ def main():
     parser.add_argument("--min_samples",      type=int,   default=DEFAULT_CFG["min_samples"])
     parser.add_argument("--norm_threshold",   type=float, default=0.5,
                         help="Confidence threshold for norm classification (default: 0.5)")
+    parser.add_argument("--norm_model",       type=str,   default="deberta",
+                        choices=list(NORM_MODEL_DIRS.keys()),
+                        help="Which norm classifier checkpoint to use (default: deberta).\n"
+                             "  deberta        -> saved_models/deberta_best\n"
+                             "  bert           -> saved_models/bert_best\n"
+                             "  roberta        -> saved_models/roberta_best\n"
+                             "  deberta_large  -> saved_models/large_models/deberta_large_best\n"
+                             "  roberta_large  -> saved_models/large_models/roberta_large_best\n"
+                             "  bert_large     -> saved_models/large_models/bert_large_best")
+    parser.add_argument("--norm_model_dir",   type=str,   default=None,
+                        help="Explicit path to norm classifier checkpoint (overrides --norm_model).\n"
+                             "Use when your Colab path differs from the default, e.g.:\n"
+                             "  --norm_model_dir /content/NLP_Project/saved_models/deberta_best")
     parser.add_argument("--no_fp16",          action="store_true")
     parser.add_argument("--patience",         type=int,   default=DEFAULT_CFG["patience"])
     parser.add_argument("--sentences", nargs="+",
@@ -956,12 +1002,13 @@ def main():
         df, label2id, id2label = build_country_dataset(args.min_samples)
         _, _, test_df = split_dataset(df)
 
-        tokenizer = AutoTokenizer.from_pretrained(COUNTRY_MDL_DIR)
+        tokenizer = AutoTokenizer.from_pretrained(COUNTRY_MDL_DIR, local_files_only=True)
         test_loader = DataLoader(
             CountryDataset(test_df, tokenizer, args.max_length),
             batch_size=32, shuffle=False, num_workers=0,
         )
-        model = AutoModelForSequenceClassification.from_pretrained(COUNTRY_MDL_DIR).to(DEVICE)
+        model = AutoModelForSequenceClassification.from_pretrained(
+            COUNTRY_MDL_DIR, local_files_only=True).to(DEVICE)
         metrics, preds, labels_list = evaluate(model, test_loader, id2label, cfg)
         country_names = [id2label[i] for i in range(len(id2label))]
         print(f"\nAccuracy   : {metrics['accuracy']}")
@@ -977,7 +1024,12 @@ def main():
             "Guests are always offered tea upon arrival.",
             "In a store, people wait in line patiently.",
         ]
-        pipeline = NormCountryPipeline(norm_threshold=args.norm_threshold)
+        # --norm_model_dir (explicit path) takes priority over --norm_model (name)
+        norm_dir = args.norm_model_dir or NORM_MODEL_DIRS[args.norm_model]
+        pipeline = NormCountryPipeline(
+            norm_model_dir=norm_dir,
+            norm_threshold=args.norm_threshold,
+        )
         results  = pipeline.predict(sentences)
 
         print(f"\n{'─'*80}")

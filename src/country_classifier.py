@@ -32,6 +32,7 @@ OUTPUTS:
 
 import os
 import sys
+import re
 import json
 import argparse
 import warnings
@@ -512,6 +513,203 @@ RAW_TO_COUNTRY = {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 3b. CONTEXTUAL COUNTRY EXTRACTION (SHORTCUT)
+#     Detects when a sentence explicitly names the country the norm belongs to,
+#     using structural patterns like:
+#       "In Japan, people bow ..."
+#       "Japanese people always ..."
+#       "In the United States, it is common ..."
+#     The shortcut is ONLY applied after the norm classifier confirms the
+#     sentence is a norm — it never bypasses the norm check.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Build a flat lookup: lowercase token → canonical country
+# Sorted longest-first so multi-word names match before their substrings.
+_TOKEN_TO_COUNTRY: dict[str, str] = {}
+for _raw, _canon in RAW_TO_COUNTRY.items():
+    _TOKEN_TO_COUNTRY[_raw.lower()] = _canon
+
+# Explicit country name aliases not already covered by demonyms in RAW_TO_COUNTRY
+_EXTRA_COUNTRY_NAMES: dict[str, str] = {
+    "united states": "United States",
+    "united states of america": "United States",
+    "usa": "United States",
+    "u.s.": "United States",
+    "u.s.a.": "United States",
+    "america": "United States",
+    "uk": "United Kingdom",
+    "united kingdom": "United Kingdom",
+    "great britain": "United Kingdom",
+    "britain": "United Kingdom",
+    "japan": "Japan",
+    "china": "China",
+    "india": "India",
+    "germany": "Germany",
+    "france": "France",
+    "italy": "Italy",
+    "spain": "Spain",
+    "russia": "Russia",
+    "canada": "Canada",
+    "australia": "Australia",
+    "brazil": "Brazil",
+    "mexico": "Mexico",
+    "south korea": "South Korea",
+    "north korea": "North Korea",
+    "netherlands": "Netherlands",
+    "sweden": "Sweden",
+    "norway": "Norway",
+    "denmark": "Denmark",
+    "finland": "Finland",
+    "poland": "Poland",
+    "switzerland": "Switzerland",
+    "austria": "Austria",
+    "belgium": "Belgium",
+    "portugal": "Portugal",
+    "greece": "Greece",
+    "turkey": "Turkey",
+    "egypt": "Egypt",
+    "nigeria": "Nigeria",
+    "kenya": "Kenya",
+    "south africa": "South Africa",
+    "indonesia": "Indonesia",
+    "malaysia": "Malaysia",
+    "singapore": "Singapore",
+    "thailand": "Thailand",
+    "vietnam": "Vietnam",
+    "philippines": "Philippines",
+    "taiwan": "Taiwan",
+    "hong kong": "Hong Kong",
+    "new zealand": "New Zealand",
+    "ireland": "Ireland",
+    "ukraine": "Ukraine",
+    "romania": "Romania",
+    "hungary": "Hungary",
+    "czech republic": "Czech Republic",
+    "czechia": "Czech Republic",
+    "bulgaria": "Bulgaria",
+    "croatia": "Croatia",
+    "serbia": "Serbia",
+    "albania": "Albania",
+    "argentina": "Argentina",
+    "chile": "Chile",
+    "colombia": "Colombia",
+    "peru": "Peru",
+    "venezuela": "Venezuela",
+    "ecuador": "Ecuador",
+    "israel": "Israel",
+    "lebanon": "Lebanon",
+    "iran": "Iran",
+    "iraq": "Iraq",
+    "pakistan": "Pakistan",
+    "bangladesh": "Bangladesh",
+    "sri lanka": "Sri Lanka",
+    "nepal": "Nepal",
+    "bhutan": "Bhutan",
+    "myanmar": "Myanmar",
+    "cambodia": "Cambodia",
+    "laos": "Laos",
+    "saudi arabia": "Saudi Arabia",
+    "afghanistan": "Afghanistan",
+    "somalia": "Somalia",
+    "sudan": "Sudan",
+    "ethiopia": "Ethiopia",
+    "angola": "Angola",
+    "cameroon": "Cameroon",
+    "botswana": "Botswana",
+    "zimbabwe": "Zimbabwe",
+    "panama": "Panama",
+    "belize": "Belize",
+    "el salvador": "El Salvador",
+    "dominican republic": "Dominican Republic",
+    "puerto rico": "Puerto Rico",
+    "belarus": "Belarus",
+    "estonia": "Estonia",
+    "cyprus": "Cyprus",
+    "bosnia and herzegovina": "Bosnia and Herzegovina",
+    "north macedonia": "North Macedonia",
+    "andorra": "Andorra",
+    "eritrea": "Eritrea",
+    "djibouti": "Djibouti",
+    "algeria": "Algeria",
+    "mauritius": "Mauritius",
+    "samoa": "Samoa",
+    "tonga": "Tonga",
+    "timor-leste": "Timor-Leste",
+    "east timor": "Timor-Leste",
+    "papua new guinea": "Papua New Guinea",
+    "palestine": "Palestine",
+    "palestinian territories": "Palestine",
+}
+for _name, _canon in _EXTRA_COUNTRY_NAMES.items():
+    _TOKEN_TO_COUNTRY[_name] = _canon
+
+# All keys sorted longest-first for greedy matching
+_SORTED_TOKENS = sorted(_TOKEN_TO_COUNTRY.keys(), key=len, reverse=True)
+
+# Regex patterns that indicate the country IS the subject of the norm.
+# Group 1 in each pattern must capture the country/demonym token.
+# Pattern A: "In <Country>, ..."  or  "In <Country> ..."
+# Pattern B: "<Demonym> people ..."  or  "<Demonym> culture ..." etc.
+# Pattern C: "people in <Country> ..."
+_SUBJECT_PATTERNS = [
+    # "In Japan," / "In the United States," — country is the setting of the norm
+    re.compile(
+        r"(?:^|[.!?]\s+)"           # start of sentence
+        r"[Ii]n\s+(?:the\s+)?"      # "In" or "In the"
+        r"([A-Z][A-Za-z '.\-]+?)"   # country/place name (capitalised)
+        r"(?:\s*,|\s+(?:people|culture|society|tradition|custom|it\s+is|one\s+is|you\s+are|residents|locals|folk|families|men|women|children|guests|hosts|students|workers|citizens))",
+        re.IGNORECASE,
+    ),
+    # "Japanese people ..." / "Indian culture ..." — demonym is the subject
+    re.compile(
+        r"(?:^|[.!?]\s+)"
+        r"([A-Z][A-Za-z '.\-]+?)\s+"
+        r"(?:people|culture|society|tradition|custom|customs|men|women|children|families|residents|locals|citizens|students|workers|hosts|guests|folk)",
+        re.IGNORECASE,
+    ),
+]
+
+
+def extract_country_from_sentence(sentence: str) -> str | None:
+    """
+    Tries to extract the canonical country name from a sentence using
+    structural patterns that indicate the country is the *subject* of the norm.
+
+    Returns the canonical country string (e.g. "Japan") or None if no
+    confident contextual match is found.
+
+    This function is intentionally conservative: it returns None whenever
+    there is ambiguity, leaving the ML model to decide.
+    """
+    s_lower = sentence.lower()
+
+    for pattern in _SUBJECT_PATTERNS:
+        m = pattern.search(sentence)
+        if not m:
+            continue
+        candidate = m.group(1).strip().lower()
+        # Try longest-first match against our token table
+        for token in _SORTED_TOKENS:
+            if candidate == token or candidate.startswith(token):
+                return _TOKEN_TO_COUNTRY[token]
+        # Fallback: check if any token is fully contained at the start
+        for token in _SORTED_TOKENS:
+            if s_lower.startswith("in " + token) or s_lower.startswith("in the " + token):
+                return _TOKEN_TO_COUNTRY[token]
+
+    # Final fallback: plain "In <country>," at sentence start (case-insensitive)
+    for token in _SORTED_TOKENS:
+        pat = re.compile(
+            r"^in\s+(?:the\s+)?" + re.escape(token) + r"\b",
+            re.IGNORECASE,
+        )
+        if pat.match(s_lower):
+            return _TOKEN_TO_COUNTRY[token]
+
+    return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 4. DATA PREPARATION
 # ─────────────────────────────────────────────────────────────────────────────
 def build_country_dataset(min_samples: int = 30):
@@ -913,15 +1111,28 @@ class NormCountryPipeline:
         country_confs = [None] * len(sentences)
 
         if norm_indices:
-            norm_sentences  = [sentences[i] for i in norm_indices]
-            country_enc     = self._encode(self.country_tokenizer, norm_sentences)
-            country_logits  = self.country_model(**country_enc).logits
-            country_probs   = torch.softmax(country_logits, dim=-1).cpu().numpy()
-            top_ids         = country_probs.argmax(axis=1)
+            # Shortcut: try to extract country directly from sentence text.
+            # Only applied to sentences already confirmed as norms.
+            model_needed = []
+            for orig_i in norm_indices:
+                extracted = extract_country_from_sentence(sentences[orig_i])
+                if extracted:
+                    country_preds[orig_i] = extracted
+                    country_confs[orig_i] = 1.0   # rule-based, full confidence
+                else:
+                    model_needed.append(orig_i)
 
-            for j, orig_i in enumerate(norm_indices):
-                country_preds[orig_i] = self.id2label[top_ids[j]]
-                country_confs[orig_i] = round(float(country_probs[j, top_ids[j]]), 4)
+            # Run ML model only on norms where the shortcut couldn't decide
+            if model_needed:
+                norm_sentences  = [sentences[i] for i in model_needed]
+                country_enc     = self._encode(self.country_tokenizer, norm_sentences)
+                country_logits  = self.country_model(**country_enc).logits
+                country_probs   = torch.softmax(country_logits, dim=-1).cpu().numpy()
+                top_ids         = country_probs.argmax(axis=1)
+
+                for j, orig_i in enumerate(model_needed):
+                    country_preds[orig_i] = self.id2label[top_ids[j]]
+                    country_confs[orig_i] = round(float(country_probs[j, top_ids[j]]), 4)
 
         results = []
         for i, sent in enumerate(sentences):

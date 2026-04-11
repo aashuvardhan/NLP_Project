@@ -26,13 +26,21 @@ PROJECT_P3/
 │   └── 03_culture_classifier.ipynb            # bonus culture label classifier (Phase 3)
 ├── src/
 │   ├── data_prep.py                 # builds the dataset from raw sources
-│   └── transformer_model.py         # fine-tuning & evaluation for all models
+│   ├── transformer_model.py         # Phase 1 — norm classifier (deberta/bert/roberta base)
+│   ├── large_models.py              # Phase 2 — large model variants (deberta/bert/roberta large)
+│   ├── country_classifier.py        # Phase 2 — country classifier + combined inference pipeline
+│   ├── error_analysis.py            # error analysis on trained norm classifier
+│   └── threshold_tuning.py          # threshold sweep (0.30→0.80) to reduce false positives
 ├── results/
 │   ├── plots/                       # training curves, confusion matrices (auto-generated)
+│   ├── large_models/                # large model results & plots (auto-generated)
+│   ├── country/                     # country classifier results & plots (auto-generated)
 │   ├── *_results.json               # per-model metrics & history (auto-generated)
 │   └── metrics_comparison.csv       # side-by-side comparison (auto-generated)
 ├── saved_models/
-│   └── {model}_best/                # best checkpoint per model (auto-generated)
+│   ├── {model}_best/                # best norm classifier checkpoint (auto-generated)
+│   ├── large_models/                # large model checkpoints (auto-generated)
+│   └── country_best/                # country classifier checkpoint (auto-generated)
 └── README.md
 ```
 
@@ -205,3 +213,199 @@ python src/transformer_model.py --model mymodel
 | `ModuleNotFoundError: seaborn` | `pip install seaborn` |
 | Model downloads slowly | Models are cached after first download in `~/.cache/huggingface/` |
 | Results not saving | Make sure you're running from inside `PROJECT_P3/` directory |
+
+---
+
+---
+
+# Phase 2 — Country Prediction Pipeline
+
+Extends the Phase 1 norm classifier with a second stage: **given a sentence that is a norm, predict which single country it belongs to.**
+
+```
+sentence → NormClassifier (threshold 0.6) → is_norm?
+                                  YES → CountryClassifier → country name + confidence
+                                  NO  → country = None
+```
+
+---
+
+## Phase 2 Dataset
+
+The country classifier trains only on **norm sentences that have a country label**. Non-norms and normbank entries (which have no country) are excluded.
+
+| Stat | Value |
+|---|---|
+| Training sentences | 13,342 |
+| Countries (classes) | 56 |
+| Norm threshold (default) | 0.6 |
+
+**Sources with country labels:** CultureBank Reddit, CultureBank TikTok, NormAD, CultureAtlas
+**Sources without country labels (excluded):** NormBank (8,000 norms) — used only in norm classifier
+
+---
+
+## Phase 2 Quick Start (Full Pipeline — BERT Example)
+
+```bash
+# Step 1 — Build dataset (skip if already done)
+python src/data_prep.py
+
+# Step 2 — Train norm classifier
+python src/transformer_model.py --model bert
+
+# Step 3 — Train country classifier
+python src/country_classifier.py --mode train --model bert
+
+# Step 4 — Run the full pipeline
+python src/country_classifier.py --mode predict \
+  --norm_model bert \
+  --sentences "In Japan, people bow when greeting someone as a sign of respect." \
+              "The sky is blue."
+```
+
+**On Google Colab:**
+
+```python
+# Step 1
+!python src/data_prep.py
+
+# Step 2
+!python src/transformer_model.py --model bert
+
+# Step 3
+!python src/country_classifier.py --mode train --model bert
+
+# Step 4
+!python src/country_classifier.py --mode predict \
+  --norm_model bert \
+  --sentences "In Japan, people bow when greeting someone as a sign of respect." \
+              "The sky is blue."
+```
+
+---
+
+## Country Classifier Commands
+
+### Train
+
+```bash
+# Train with DeBERTa backbone (default)
+python src/country_classifier.py --mode train
+
+# Train with BERT backbone
+python src/country_classifier.py --mode train --model bert
+
+# Train with RoBERTa backbone
+python src/country_classifier.py --mode train --model roberta
+
+# Train with DeBERTa-large backbone
+python src/country_classifier.py --mode train --model deberta_large --batch_size 8 --grad_accumulation 4
+```
+
+### Evaluate
+
+```bash
+# Re-run test set evaluation without retraining
+python src/country_classifier.py --mode eval
+```
+
+### Predict
+
+```bash
+# Default (uses deberta norm classifier, threshold 0.6)
+python src/country_classifier.py --mode predict \
+  --sentences "In India, people touch the feet of elders as a sign of respect." \
+              "The Himalayas are the tallest mountain range."
+
+# Specify which norm classifier to use
+python src/country_classifier.py --mode predict --norm_model bert \
+  --sentences "In Japan, people avoid talking on the phone on public transport."
+
+# Override norm threshold
+python src/country_classifier.py --mode predict --norm_threshold 0.7 \
+  --sentences "In China, people present business cards with both hands."
+
+# Override norm model path explicitly (useful on Colab with custom paths)
+python src/country_classifier.py --mode predict \
+  --norm_model_dir /content/NLP_Project/saved_models/bert_best \
+  --sentences "In America, people tip servers 15 to 20 percent after a meal."
+```
+
+---
+
+## Country Classifier Hyperparameter Flags
+
+| Flag | Default | Description |
+|---|---|---|
+| `--mode` | `train` | `train`, `eval`, or `predict` |
+| `--model` | `deberta` | Country classifier backbone: `deberta`, `bert`, `roberta`, `deberta_large`, `roberta_large`, `bert_large` |
+| `--norm_model` | `deberta` | Which norm classifier checkpoint to use at prediction time |
+| `--norm_model_dir` | auto | Explicit path to norm classifier checkpoint (overrides `--norm_model`) |
+| `--norm_threshold` | `0.6` | Minimum confidence to classify a sentence as a norm |
+| `--epochs` | `5` | Max training epochs |
+| `--batch_size` | `16` | Per-GPU batch size |
+| `--grad_accumulation` | `2` | Gradient accumulation steps |
+| `--lr` | `2e-5` | Learning rate |
+| `--max_length` | `128` | Max token length |
+| `--min_samples` | `30` | Drop countries with fewer than this many labelled norms |
+| `--patience` | `2` | Early stopping patience |
+
+---
+
+## Large Model Variants
+
+`src/large_models.py` runs the same pipeline with larger checkpoints (~340–400M params). Use when you want to compare large vs base model performance.
+
+| Model | Checkpoint | ~VRAM |
+|---|---|---|
+| `deberta_large` | microsoft/deberta-v3-large | 14 GB (batch=8) |
+| `roberta_large` | roberta-large | 12 GB (batch=8) |
+| `bert_large` | bert-large-uncased | 11 GB (batch=8) |
+
+```bash
+# Train DeBERTa-large norm classifier (recommended first)
+python src/large_models.py --model deberta_large
+
+# Train RoBERTa-large
+python src/large_models.py --model roberta_large
+
+# Train BERT-large
+python src/large_models.py --model bert_large
+
+# Train all three sequentially
+python src/large_models.py --model all
+
+# Low VRAM (T4 16 GB) — reduce batch size
+python src/large_models.py --model deberta_large --batch_size 4 --grad_accumulation 8
+```
+
+Large model results save to `results/large_models/` and checkpoints to `saved_models/large_models/` — separate from base model outputs.
+
+---
+
+## Phase 2 Outputs
+
+| Output | Location | Description |
+|---|---|---|
+| Country model weights | `saved_models/country_best/` | Best HuggingFace checkpoint |
+| Label map | `saved_models/country_best/label_map.json` | `id → country` mapping (required for inference) |
+| Metrics (JSON) | `results/country/country_results.json` | Accuracy, F1-macro, F1-weighted + history |
+| Training curves | `results/country/plots/country_training_curves.png` | Loss & F1 per epoch |
+| Confusion matrix | `results/country/plots/country_confusion_matrix.png` | 56-class test set predictions |
+| Large model results | `results/large_models/` | Per-model JSON + plots |
+| Large model comparison | `results/large_models/large_models_comparison.csv` | Side-by-side (when running `all`) |
+
+---
+
+## Phase 2 Troubleshooting
+
+| Problem | Fix |
+|---|---|
+| `Norm model not found` | Run `python src/transformer_model.py --model bert` first |
+| `Country model not found` | Run `python src/country_classifier.py --mode train` first |
+| `label_map.json not found` | Country model directory is incomplete — retrain with `--mode train` |
+| Wrong norm model loaded | Use `--norm_model bert/roberta/deberta` to match what you trained |
+| Path mismatch on Colab | Use `--norm_model_dir /full/path/to/checkpoint` to override |
+| Low country confidence | Expected for cross-cultural norms (e.g. "use right hand for food") — shared across many countries |
+| False positives (non-norms predicted as norms) | Raise `--norm_threshold` to `0.65` or `0.7` |

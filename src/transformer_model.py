@@ -91,15 +91,9 @@ DEFAULT_CFG = {
 }
 
 # Per-model overrides — merged on top of DEFAULT_CFG before training.
-# BERT diverges with the default LR (val_f1 drops each epoch then early-stops
-# at epoch 3).  A lower LR, longer warmup, and more patience stabilise it.
 MODEL_CFG_OVERRIDES = {
     "bert": {
-        "learning_rate":     1e-5,   # halved — BERT is sensitive to high LRs
-        "warmup_ratio":      0.2,    # longer ramp-up to avoid early instability
-        "grad_accumulation": 4,      # larger effective batch → smoother gradients
-        "patience":          3,      # give it one extra epoch before stopping
-        "weight_decay":      0.02,   # slightly stronger regularisation
+        "epochs": 5,
     },
 }
 

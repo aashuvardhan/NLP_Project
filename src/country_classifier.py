@@ -108,12 +108,7 @@ DEFAULT_CFG = {
 # Per-backbone overrides applied before training (same pattern as transformer_model.py)
 BACKBONE_CFG_OVERRIDES = {
     "bert": {
-        "epochs":          10,     # more epochs — bert needs longer to converge
-        "learning_rate":   1e-5,   # lower LR for stability
-        "warmup_ratio":    0.2,    # longer warmup
-        "grad_accumulation": 4,    # smoother gradients
-        "patience":        3,      # more tolerance before early stop
-        "weight_decay":    0.02,
+        "epochs": 5,
     },
 }
 

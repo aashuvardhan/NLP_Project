@@ -93,7 +93,11 @@ DEFAULT_CFG = {
 # Per-model overrides — merged on top of DEFAULT_CFG before training.
 MODEL_CFG_OVERRIDES = {
     "bert": {
-        "epochs": 5,
+        "epochs":        5,
+        "learning_rate": 1e-5,       # lower LR — BERT overfits faster than DeBERTa
+        "warmup_ratio":  0.2,        # longer warmup to stabilize early training
+        "weight_decay":  0.05,       # stronger regularization to reduce overconfidence
+        "patience":      3,          # give more epochs before early-stopping
     },
 }
 

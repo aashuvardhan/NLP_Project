@@ -105,6 +105,18 @@ DEFAULT_CFG = {
     "min_samples":     30,   # drop countries with fewer than this many labelled norms
 }
 
+# Per-backbone overrides applied before training (same pattern as transformer_model.py)
+BACKBONE_CFG_OVERRIDES = {
+    "bert": {
+        "epochs":          10,     # more epochs — bert needs longer to converge
+        "learning_rate":   1e-5,   # lower LR for stability
+        "warmup_ratio":    0.2,    # longer warmup
+        "grad_accumulation": 4,    # smoother gradients
+        "patience":        3,      # more tolerance before early stop
+        "weight_decay":    0.02,
+    },
+}
+
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -911,6 +923,12 @@ def plot_training_curves(history):
 # 8. TRAINING
 # ─────────────────────────────────────────────────────────────────────────────
 def train(cfg: dict):
+    # Apply per-backbone overrides (e.g. bert gets 10 epochs, lower LR, etc.)
+    cfg = cfg.copy()
+    if cfg["backbone"] in BACKBONE_CFG_OVERRIDES:
+        cfg.update(BACKBONE_CFG_OVERRIDES[cfg["backbone"]])
+        print(f"  [INFO] Applying {cfg['backbone']} overrides: {BACKBONE_CFG_OVERRIDES[cfg['backbone']]}")
+
     print("\n=== Building country dataset ===")
     df, label2id, id2label = build_country_dataset(cfg["min_samples"])
     train_df, val_df, test_df = split_dataset(df)

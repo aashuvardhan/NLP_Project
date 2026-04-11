@@ -147,10 +147,13 @@ def compute_metrics(preds, labels):
 # ─────────────────────────────────────────────────────────────────────────────
 # 6. TRAIN / EVAL LOOPS
 # ─────────────────────────────────────────────────────────────────────────────
-def train_epoch(model, loader, optimizer, scheduler, scaler, cfg):
+def train_epoch(model, loader, optimizer, scheduler, scaler, cfg, class_weights=None):
     model.train()
     total_loss = 0
     optimizer.zero_grad()
+    loss_fn = torch.nn.CrossEntropyLoss(
+        weight=class_weights.to(DEVICE) if class_weights is not None else None
+    )
 
     for step, batch in enumerate(loader):
         input_ids      = batch["input_ids"].to(DEVICE)
@@ -159,9 +162,8 @@ def train_epoch(model, loader, optimizer, scheduler, scaler, cfg):
 
         with autocast(enabled=cfg["fp16"]):
             outputs = model(input_ids=input_ids,
-                            attention_mask=attention_mask,
-                            labels=labels)
-            loss = outputs.loss / cfg["grad_accumulation"]
+                            attention_mask=attention_mask)
+            loss = loss_fn(outputs.logits, labels) / cfg["grad_accumulation"]
 
         scaler.scale(loss).backward()
 
@@ -297,6 +299,11 @@ def train_model(model_key: str, train_df, val_df, test_df, cfg: dict):
         model_name, num_labels=2, ignore_mismatched_sizes=True
     ).to(DEVICE).float()  # DeBERTa-v3 can load some params as FP16; force FP32 so GradScaler works
 
+    # Compute class weights to handle label imbalance (normbank re-labeling -> ~65/35 split)
+    counts = train_df["label"].value_counts().sort_index().values.astype(float)
+    class_weights = torch.tensor(counts.sum() / (len(counts) * counts), dtype=torch.float32)
+    print(f"  Class weights: {class_weights.tolist()}")
+
     total_steps  = (len(train_loader) // cfg["grad_accumulation"]) * cfg["epochs"]
     warmup_steps = int(total_steps * cfg["warmup_ratio"])
     optimizer    = torch.optim.AdamW(model.parameters(),
@@ -312,7 +319,7 @@ def train_model(model_key: str, train_df, val_df, test_df, cfg: dict):
 
     for epoch in range(1, cfg["epochs"] + 1):
         print(f"\n  Epoch {epoch}/{cfg['epochs']}")
-        train_loss = train_epoch(model, train_loader, optimizer, scheduler, scaler, cfg)
+        train_loss = train_epoch(model, train_loader, optimizer, scheduler, scaler, cfg, class_weights)
         val_metrics, _, _ = evaluate(model, val_loader, cfg)
 
         history["train_loss"].append(train_loss)

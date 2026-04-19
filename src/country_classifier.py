@@ -1319,6 +1319,8 @@ def main():
         norm_dir = args.norm_model_dir or NORM_MODEL_DIRS[args.norm_model]
         pipeline = NormCountryPipeline(
             norm_model_dir=norm_dir,
+            norm_model=args.norm_model,
+            country_model=args.model,
             norm_threshold=args.norm_threshold,
         )
         results  = pipeline.predict(sentences)

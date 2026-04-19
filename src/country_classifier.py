@@ -64,7 +64,14 @@ BASE             = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR         = os.path.join(BASE, "data")
 RESULTS_DIR      = os.path.join(BASE, "results", "country")
 PLOTS_DIR        = os.path.join(RESULTS_DIR, "plots")
-COUNTRY_MDL_DIR  = os.path.join(BASE, "saved_models", "country_best")
+
+# Per-backbone country model dirs (mirroring Phase 1 naming convention)
+COUNTRY_MODEL_DIRS = {
+    "deberta": os.path.join(BASE, "saved_models", "country_deberta_best"),
+    "bert":    os.path.join(BASE, "saved_models", "country_bert_best"),
+    "roberta": os.path.join(BASE, "saved_models", "country_roberta_best"),
+}
+COUNTRY_MDL_DIR = COUNTRY_MODEL_DIRS["deberta"]   # default (kept for backward compat)
 
 # Norm classifier checkpoints — one per backbone (matches transformer_model.py naming)
 NORM_MODEL_DIRS = {
@@ -77,7 +84,7 @@ NORM_MODEL_DIRS = {
 }
 NORM_MDL_DIR = NORM_MODEL_DIRS["deberta"]   # default
 
-for d in [RESULTS_DIR, PLOTS_DIR, COUNTRY_MDL_DIR]:
+for d in [RESULTS_DIR, PLOTS_DIR, *COUNTRY_MODEL_DIRS.values()]:
     os.makedirs(d, exist_ok=True)
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -874,7 +881,7 @@ def evaluate(model, loader, id2label, cfg):
 # ─────────────────────────────────────────────────────────────────────────────
 # 7. PLOTS
 # ─────────────────────────────────────────────────────────────────────────────
-def plot_confusion_matrix(labels, preds, id2label):
+def plot_confusion_matrix(labels, preds, id2label, backbone_key):
     n = len(id2label)
     country_names = [id2label[i] for i in range(n)]
     cm = confusion_matrix(labels, preds)
@@ -886,55 +893,85 @@ def plot_confusion_matrix(labels, preds, id2label):
                 ax=ax, linewidths=0.3)
     ax.set_xlabel("Predicted", fontsize=10)
     ax.set_ylabel("Actual", fontsize=10)
-    ax.set_title("Country Classifier — Confusion Matrix", fontsize=12)
+    ax.set_title(f"Country Classifier ({backbone_key.upper()}) — Confusion Matrix", fontsize=12)
     plt.xticks(rotation=45, ha="right", fontsize=7)
     plt.yticks(rotation=0, fontsize=7)
     plt.tight_layout()
-    path = os.path.join(PLOTS_DIR, "country_confusion_matrix.png")
+    path = os.path.join(PLOTS_DIR, f"country_{backbone_key}_confusion_matrix.png")
     plt.savefig(path, dpi=120)
     plt.close()
     print(f"  Confusion matrix saved -> {path}")
 
 
-def plot_training_curves(history):
+def plot_training_curves(history, backbone_key):
     epochs = range(1, len(history["train_loss"]) + 1)
     fig, axes = plt.subplots(1, 2, figsize=(12, 4))
     axes[0].plot(epochs, history["train_loss"], "b-o", label="Train Loss")
     axes[0].plot(epochs, history["val_loss"],   "r-o", label="Val Loss")
-    axes[0].set_title("Loss"); axes[0].set_xlabel("Epoch")
+    axes[0].set_title(f"{backbone_key.upper()} - Loss"); axes[0].set_xlabel("Epoch")
     axes[0].legend(); axes[0].grid(True)
     axes[1].plot(epochs, history["val_f1_macro"],    "g-o", label="Val F1-Macro")
     axes[1].plot(epochs, history["val_accuracy"],    "m-o", label="Val Accuracy")
-    axes[1].set_title("Validation Metrics"); axes[1].set_xlabel("Epoch")
+    axes[1].set_title(f"{backbone_key.upper()} - Validation Metrics"); axes[1].set_xlabel("Epoch")
     axes[1].set_ylim(0, 1); axes[1].legend(); axes[1].grid(True)
     plt.tight_layout()
-    path = os.path.join(PLOTS_DIR, "country_training_curves.png")
+    path = os.path.join(PLOTS_DIR, f"country_{backbone_key}_training_curves.png")
     plt.savefig(path, dpi=150)
     plt.close()
     print(f"  Training curves saved -> {path}")
 
 
+def save_country_comparison_chart(all_results: dict):
+    rows = [{"Model": k.upper(), **v} for k, v in all_results.items()]
+    df = pd.DataFrame(rows).sort_values("f1_macro", ascending=False)
+    df.to_csv(os.path.join(RESULTS_DIR, "country_metrics_comparison.csv"), index=False)
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    x = np.arange(len(df)); w = 0.25
+    for i, (col, color) in enumerate(zip(
+        ["accuracy", "f1_macro", "f1_weighted"],
+        ["#4C72B0", "#55A868", "#C44E52"]
+    )):
+        ax.bar(x + i*w, df[col], width=w, label=col.replace("_", " ").capitalize(), color=color)
+    ax.set_xticks(x + w); ax.set_xticklabels(df["Model"])
+    ax.set_ylim(0.0, 1.0); ax.set_ylabel("Score")
+    ax.set_title("Country Classifier — Model Comparison")
+    ax.legend(); ax.grid(axis="y", alpha=0.4)
+    plt.tight_layout()
+    path = os.path.join(PLOTS_DIR, "country_model_comparison.png")
+    plt.savefig(path, dpi=150); plt.close()
+    print(f"  Comparison chart saved -> {path}")
+    print(df[["Model", "accuracy", "f1_macro", "f1_weighted"]].to_string(index=False))
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 8. TRAINING
 # ─────────────────────────────────────────────────────────────────────────────
-def train(cfg: dict):
-    # Apply per-backbone overrides (e.g. bert gets 10 epochs, lower LR, etc.)
+def train(cfg: dict, train_df=None, val_df=None, test_df=None,
+          label2id=None, id2label=None):
+    # Apply per-backbone overrides
     cfg = cfg.copy()
-    if cfg["backbone"] in BACKBONE_CFG_OVERRIDES:
-        cfg.update(BACKBONE_CFG_OVERRIDES[cfg["backbone"]])
-        print(f"  [INFO] Applying {cfg['backbone']} overrides: {BACKBONE_CFG_OVERRIDES[cfg['backbone']]}")
+    backbone_key = cfg["backbone"]
+    if backbone_key in BACKBONE_CFG_OVERRIDES:
+        cfg.update(BACKBONE_CFG_OVERRIDES[backbone_key])
+        print(f"  [INFO] Applying {backbone_key} overrides: {BACKBONE_CFG_OVERRIDES[backbone_key]}")
 
-    print("\n=== Building country dataset ===")
-    df, label2id, id2label = build_country_dataset(cfg["min_samples"])
-    train_df, val_df, test_df = split_dataset(df)
+    # Build dataset once if not passed in (single-model run)
+    if train_df is None:
+        print("\n=== Building country dataset ===")
+        df, label2id, id2label = build_country_dataset(cfg["min_samples"])
+        train_df, val_df, test_df = split_dataset(df)
 
-    # Save label maps so inference can load without re-building dataset
-    label_map_path = os.path.join(COUNTRY_MDL_DIR, "label_map.json")
+    save_dir = COUNTRY_MODEL_DIRS[backbone_key]
+    os.makedirs(save_dir, exist_ok=True)
+
+    # Save label map into this backbone's folder
+    label_map_path = os.path.join(save_dir, "label_map.json")
     with open(label_map_path, "w") as f:
         json.dump({"label2id": label2id, "id2label": id2label}, f, indent=2)
     print(f"  Label map saved -> {label_map_path}")
 
-    backbone = BACKBONE_CHOICES[cfg["backbone"]]
+    backbone = BACKBONE_CHOICES[backbone_key]
     print(f"\n=== Training country classifier: {backbone} ===")
     print(f"  Device: {DEVICE}  |  Classes: {len(label2id)}")
     print(f"  Batch: {cfg['batch_size']}  |  GradAccum: {cfg['grad_accumulation']}"
@@ -982,9 +1019,9 @@ def train(cfg: dict):
         if val_metrics["f1_macro"] > best_val_f1:
             best_val_f1 = val_metrics["f1_macro"]
             patience_left = cfg["patience"]
-            model.save_pretrained(COUNTRY_MDL_DIR)
-            tokenizer.save_pretrained(COUNTRY_MDL_DIR)
-            print(f"    ** Best model saved (val_f1={best_val_f1:.4f}) **")
+            model.save_pretrained(save_dir)
+            tokenizer.save_pretrained(save_dir)
+            print(f"    ** Best model saved to {save_dir} (val_f1={best_val_f1:.4f}) **")
         else:
             patience_left -= 1
             if patience_left == 0:
@@ -992,8 +1029,8 @@ def train(cfg: dict):
                 break
 
     # ── Test evaluation ──
-    print("\n=== Test Set Evaluation ===")
-    best_model = AutoModelForSequenceClassification.from_pretrained(COUNTRY_MDL_DIR).to(DEVICE)
+    print(f"\n=== Test Set Evaluation [{backbone_key.upper()}] ===")
+    best_model = AutoModelForSequenceClassification.from_pretrained(save_dir).to(DEVICE)
     test_metrics, test_preds, test_labels_list = evaluate(best_model, test_loader, id2label, cfg)
 
     print(f"  accuracy   : {test_metrics['accuracy']}")
@@ -1003,14 +1040,17 @@ def train(cfg: dict):
     country_names = [id2label[i] for i in range(len(id2label))]
     print(f"\n{classification_report(test_labels_list, test_preds, target_names=country_names, zero_division=0)}")
 
-    plot_training_curves(history)
-    plot_confusion_matrix(test_labels_list, test_preds, id2label)
+    plot_training_curves(history, backbone_key)
+    plot_confusion_matrix(test_labels_list, test_preds, id2label, backbone_key)
 
-    with open(os.path.join(RESULTS_DIR, "country_results.json"), "w") as f:
-        json.dump({"backbone": backbone, "config": cfg,
+    with open(os.path.join(RESULTS_DIR, f"country_{backbone_key}_results.json"), "w") as f:
+        json.dump({"backbone": backbone, "backbone_key": backbone_key, "config": cfg,
                    "num_classes": len(label2id),
                    "countries": [id2label[i] for i in range(len(id2label))],
                    "history": history, "test_metrics": test_metrics}, f, indent=2)
+
+    del model, best_model
+    torch.cuda.empty_cache()
 
     print(f"\nAll outputs saved to {RESULTS_DIR}/")
     return test_metrics
@@ -1026,7 +1066,7 @@ class NormCountryPipeline:
         sentence  →  is_norm (bool)  +  country (str | None)  +  confidences
 
     Usage:
-        pipeline = NormCountryPipeline()
+        pipeline = NormCountryPipeline(norm_model="deberta", country_model="deberta")
         results  = pipeline.predict(["People bow when greeting.", "The sky is blue."])
         for r in results:
             print(r)
@@ -1034,9 +1074,16 @@ class NormCountryPipeline:
 
     def __init__(self,
                  norm_model_dir:    str = NORM_MDL_DIR,
-                 country_model_dir: str = COUNTRY_MDL_DIR,
+                 country_model_dir: str = None,
+                 norm_model:        str = "deberta",
+                 country_model:     str = "deberta",
                  norm_threshold:    float = 0.5,
                  device:            torch.device = DEVICE):
+        # Resolve dirs from backbone keys if explicit dirs not provided
+        if norm_model_dir == NORM_MDL_DIR and norm_model != "deberta":
+            norm_model_dir = NORM_MODEL_DIRS.get(norm_model, NORM_MDL_DIR)
+        if country_model_dir is None:
+            country_model_dir = COUNTRY_MODEL_DIRS.get(country_model, COUNTRY_MODEL_DIRS["deberta"])
 
         self.device         = device
         self.norm_threshold = norm_threshold
@@ -1172,8 +1219,8 @@ def main():
     )
     parser.add_argument("--mode", choices=["train", "eval", "predict"], default="train",
                         help="train | eval | predict")
-    parser.add_argument("--model", choices=list(BACKBONE_CHOICES.keys()), default="deberta",
-                        help="Backbone model (default: deberta)")
+    parser.add_argument("--model", choices=list(BACKBONE_CHOICES.keys()) + ["all"], default="deberta",
+                        help="Backbone model (default: deberta). Use 'all' to train deberta, bert, roberta.")
     parser.add_argument("--epochs",           type=int,   default=DEFAULT_CFG["epochs"])
     parser.add_argument("--batch_size",       type=int,   default=DEFAULT_CFG["batch_size"])
     parser.add_argument("--grad_accumulation",type=int,   default=DEFAULT_CFG["grad_accumulation"])
@@ -1203,7 +1250,6 @@ def main():
 
     if args.mode == "train":
         cfg = DEFAULT_CFG.copy()
-        cfg["backbone"]          = args.model
         cfg["epochs"]            = args.epochs
         cfg["batch_size"]        = args.batch_size
         cfg["grad_accumulation"] = args.grad_accumulation
@@ -1216,7 +1262,28 @@ def main():
         print(f"Device : {DEVICE}")
         if DEVICE.type == "cuda":
             print(f"GPU    : {torch.cuda.get_device_name(0)}")
-        train(cfg)
+
+        backbones_to_run = (
+            [k for k in BACKBONE_CHOICES if k in ("deberta", "bert", "roberta")]
+            if args.model == "all"
+            else [args.model]
+        )
+
+        # Build dataset once and reuse across all backbone runs
+        print("\n=== Building country dataset ===")
+        df, label2id, id2label = build_country_dataset(cfg["min_samples"])
+        train_df, val_df, test_df = split_dataset(df)
+
+        all_results = {}
+        for bk in backbones_to_run:
+            run_cfg = cfg.copy()
+            run_cfg["backbone"] = bk
+            all_results[bk] = train(run_cfg, train_df, val_df, test_df, label2id, id2label)
+
+        if len(all_results) > 1:
+            save_country_comparison_chart(all_results)
+
+        print("\nDone. All country classifier results in results/country/")
 
     elif args.mode == "eval":
         # Re-run evaluation on test split without retraining

@@ -81,13 +81,20 @@ DEFAULT_CFG = {
     "max_length":        128,    # token length per sentence
     "batch_size":        16,     # per-GPU batch size (lower if OOM: try 8)
     "grad_accumulation": 2,      # effective batch = batch_size * grad_accumulation
-    "epochs":            4,      # max training epochs
+    "epochs":            10,     # max training epochs
     "learning_rate":     2e-5,   # AdamW learning rate
     "warmup_ratio":      0.1,    # fraction of steps used for LR warmup
     "weight_decay":      0.01,
     "fp16":              True,   # mixed precision (set False if GPU issues)
     "seed":              42,
     "patience":          2,      # early stopping: stop after N epochs no improvement
+}
+
+# Per-model overrides — merged on top of DEFAULT_CFG before training.
+MODEL_CFG_OVERRIDES = {
+    "bert": {
+        "epochs": 5,
+    },
 }
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -257,6 +264,12 @@ def save_comparison_chart(all_results):
 # 8. MAIN TRAINING FUNCTION
 # ─────────────────────────────────────────────────────────────────────────────
 def train_model(model_key: str, train_df, val_df, test_df, cfg: dict):
+    # Apply any per-model hyperparameter overrides on top of the base config
+    cfg = cfg.copy()
+    if model_key in MODEL_CFG_OVERRIDES:
+        cfg.update(MODEL_CFG_OVERRIDES[model_key])
+        print(f"  [INFO] Applying {model_key} overrides: {MODEL_CFG_OVERRIDES[model_key]}")
+
     model_name = MODELS[model_key]
     print(f"\n{'='*60}")
     print(f"  Model   : {model_name}")

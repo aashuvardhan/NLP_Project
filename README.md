@@ -40,7 +40,9 @@ PROJECT_P3/
 ├── saved_models/
 │   ├── {model}_best/                # best norm classifier checkpoint (auto-generated)
 │   ├── large_models/                # large model checkpoints (auto-generated)
-│   └── country_best/                # country classifier checkpoint (auto-generated)
+│   ├── country_deberta_best/        # country classifier — DeBERTa backbone (auto-generated)
+│   ├── country_bert_best/           # country classifier — BERT backbone (auto-generated)
+│   └── country_roberta_best/        # country classifier — RoBERTa backbone (auto-generated)
 └── README.md
 ```
 
@@ -245,21 +247,23 @@ The country classifier trains only on **norm sentences that have a country label
 
 ---
 
-## Phase 2 Quick Start (Full Pipeline — BERT Example)
+## Phase 2 Quick Start
+
+### Train all three backbones (recommended)
 
 ```bash
 # Step 1 — Build dataset (skip if already done)
 python src/data_prep.py
 
-# Step 2 — Train norm classifier
-python src/transformer_model.py --model bert
+# Step 2 — Train all Phase 1 norm classifiers
+python src/transformer_model.py --model all
 
-# Step 3 — Train country classifier
-python src/country_classifier.py --mode train --model bert
+# Step 3 — Train all Phase 2 country classifiers
+python src/country_classifier.py --mode train --model all
 
-# Step 4 — Run the full pipeline
+# Step 4 — Run the full pipeline (uses deberta by default)
 python src/country_classifier.py --mode predict \
-  --norm_model bert \
+  --norm_model deberta \
   --sentences "In Japan, people bow when greeting someone as a sign of respect." \
               "The sky is blue."
 ```
@@ -267,20 +271,26 @@ python src/country_classifier.py --mode predict \
 **On Google Colab:**
 
 ```python
-# Step 1
-!python src/data_prep.py
-
 # Step 2
-!python src/transformer_model.py --model bert
+!python src/transformer_model.py --model all
 
 # Step 3
-!python src/country_classifier.py --mode train --model bert
+!python src/country_classifier.py --mode train --model all
 
 # Step 4
 !python src/country_classifier.py --mode predict \
-  --norm_model bert \
+  --norm_model deberta \
   --sentences "In Japan, people bow when greeting someone as a sign of respect." \
               "The sky is blue."
+```
+
+### Train a single backbone (BERT example)
+
+```bash
+python src/transformer_model.py --model bert
+python src/country_classifier.py --mode train --model bert
+python src/country_classifier.py --mode predict --norm_model bert \
+  --sentences "In Japan, people bow when greeting someone as a sign of respect."
 ```
 
 ---
@@ -290,16 +300,15 @@ python src/country_classifier.py --mode predict \
 ### Train
 
 ```bash
-# Train with DeBERTa backbone (default)
-python src/country_classifier.py --mode train
+# Train all three backbones sequentially (recommended — builds dataset once)
+python src/country_classifier.py --mode train --model all
 
-# Train with BERT backbone
+# Train a single backbone
+python src/country_classifier.py --mode train --model deberta
 python src/country_classifier.py --mode train --model bert
-
-# Train with RoBERTa backbone
 python src/country_classifier.py --mode train --model roberta
 
-# Train with DeBERTa-large backbone
+# Train with DeBERTa-large backbone (high VRAM required)
 python src/country_classifier.py --mode train --model deberta_large --batch_size 8 --grad_accumulation 4
 ```
 
@@ -312,19 +321,32 @@ python src/country_classifier.py --mode eval
 
 ### Predict
 
+Both `--norm_model` and `--model` (country backbone) default to `deberta`. Mix and match any trained combination.
+
 ```bash
-# Default (uses deberta norm classifier, threshold 0.6)
+# Default — deberta norm classifier + deberta country classifier, threshold 0.6
 python src/country_classifier.py --mode predict \
   --sentences "In India, people touch the feet of elders as a sign of respect." \
               "The Himalayas are the tallest mountain range."
 
-# Specify which norm classifier to use
-python src/country_classifier.py --mode predict --norm_model bert \
+# Use BERT for both norm and country classification
+python src/country_classifier.py --mode predict \
+  --norm_model bert --model bert \
   --sentences "In Japan, people avoid talking on the phone on public transport."
 
-# Override norm threshold
-python src/country_classifier.py --mode predict --norm_threshold 0.7 \
+# Use RoBERTa for both
+python src/country_classifier.py --mode predict \
+  --norm_model roberta --model roberta \
   --sentences "In China, people present business cards with both hands."
+
+# Mix — DeBERTa norm classifier, BERT country classifier
+python src/country_classifier.py --mode predict \
+  --norm_model deberta --model bert \
+  --sentences "Guests are always offered tea upon arrival."
+
+# Override norm threshold (raise to reduce false positives)
+python src/country_classifier.py --mode predict --norm_threshold 0.7 \
+  --sentences "In Brazil, people greet with a kiss on the cheek."
 
 # Override norm model path explicitly (useful on Colab with custom paths)
 python src/country_classifier.py --mode predict \
@@ -339,8 +361,8 @@ python src/country_classifier.py --mode predict \
 | Flag | Default | Description |
 |---|---|---|
 | `--mode` | `train` | `train`, `eval`, or `predict` |
-| `--model` | `deberta` | Country classifier backbone: `deberta`, `bert`, `roberta`, `deberta_large`, `roberta_large`, `bert_large` |
-| `--norm_model` | `deberta` | Which norm classifier checkpoint to use at prediction time |
+| `--model` | `deberta` | Country classifier backbone: `deberta`, `bert`, `roberta`, `all`, `deberta_large`, `roberta_large`, `bert_large` |
+| `--norm_model` | `deberta` | Norm classifier backbone to use at predict time: `deberta`, `bert`, `roberta` |
 | `--norm_model_dir` | auto | Explicit path to norm classifier checkpoint (overrides `--norm_model`) |
 | `--norm_threshold` | `0.6` | Minimum confidence to classify a sentence as a norm |
 | `--epochs` | `5` | Max training epochs |
@@ -386,13 +408,17 @@ Large model results save to `results/large_models/` and checkpoints to `saved_mo
 
 ## Phase 2 Outputs
 
+Each backbone produces its own set of outputs. `{model}` is one of `deberta`, `bert`, or `roberta`.
+
 | Output | Location | Description |
 |---|---|---|
-| Country model weights | `saved_models/country_best/` | Best HuggingFace checkpoint |
-| Label map | `saved_models/country_best/label_map.json` | `id → country` mapping (required for inference) |
-| Metrics (JSON) | `results/country/country_results.json` | Accuracy, F1-macro, F1-weighted + history |
-| Training curves | `results/country/plots/country_training_curves.png` | Loss & F1 per epoch |
-| Confusion matrix | `results/country/plots/country_confusion_matrix.png` | 56-class test set predictions |
+| Country model weights | `saved_models/country_{model}_best/` | Best HuggingFace checkpoint per backbone |
+| Label map | `saved_models/country_{model}_best/label_map.json` | `id → country` mapping (required for inference) |
+| Metrics (JSON) | `results/country/country_{model}_results.json` | Accuracy, F1-macro, F1-weighted + history |
+| Training curves | `results/country/plots/country_{model}_training_curves.png` | Loss & F1 per epoch |
+| Confusion matrix | `results/country/plots/country_{model}_confusion_matrix.png` | 56-class test set predictions |
+| Comparison table | `results/country/country_metrics_comparison.csv` | All three backbones side-by-side (when running `all`) |
+| Comparison chart | `results/country/plots/country_model_comparison.png` | Bar chart of all backbones (when running `all`) |
 | Large model results | `results/large_models/` | Per-model JSON + plots |
 | Large model comparison | `results/large_models/large_models_comparison.csv` | Side-by-side (when running `all`) |
 

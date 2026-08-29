@@ -1,0 +1,56 @@
+version: "3.9"
+
+services:
+
+  # ── Python FastAPI backend ────────────────────────────────────────────────
+  backend:
+    build:
+      context: ./webapp/backend
+      dockerfile: Dockerfile
+    volumes:
+      # Mount model weights and results read-only into the container
+      - ./saved_models:/app/saved_models:ro
+      - ./results:/app/results:ro
+    ports:
+      - "8000:8000"   # expose to host so local npm dev server can proxy to it
+    networks:
+      - p3net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s   # give time for model preloading
+
+
+  # ── React + Vite frontend ─────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./webapp/frontend
+      dockerfile: Dockerfile
+    networks:
+      - p3net
+    restart: unless-stopped
+
+  # ── Nginx reverse proxy ───────────────────────────────────────────────────
+  nginx:
+    build:
+      context: ./webapp/nginx
+      dockerfile: Dockerfile
+    ports:
+      - "80:80"
+    volumes:
+      # Two separate (non-nested) mounts — nesting causes read-only FS errors in Docker
+      - ./results/plots:/app/norm_plots:ro
+      - ./results/country/plots:/app/country_plots:ro
+    depends_on:
+      - backend
+      - frontend
+    networks:
+      - p3net
+    restart: unless-stopped
+
+networks:
+  p3net:
+    driver: bridge
